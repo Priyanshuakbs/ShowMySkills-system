@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   Search,
@@ -10,97 +10,478 @@ import {
   Check,
   RotateCcw,
   Sparkles,
+  MapPin,
+  CalendarDays,
+  Wallet,
+  Monitor,
+  ExternalLink,
+  Trash2,
+  CheckCircle,
+  Briefcase,
+  Building2,
+  BadgeCheck,
 } from "lucide-react";
+
 import DashboardSidebar from "@/components/DashboardSidebar";
 import DashboardHeader from "@/components/DashboardHeader";
 import InternshipCard from "@/features/internships/InternshipCard";
-import { mockInternships } from "@/features/internships/mockData";
 
-/**
- * InternshipsPage — Interactive Internship Discovery Feed with Swipe Deck Physics.
- *
- * Features:
- * - Interactive Framer Motion card stack (Tinder-style gesture & button navigation).
- * - Drag physics with horizontal translation, dynamic rotation, and ACCEPT/REJECT overlay stamps.
- * - Stacking depth effect (subtle scaling and Y-offset for background cards).
- * - Synchronized bottom action buttons (Reject, Save, Accept).
- * - Empty state with interactive reload deck button.
- * - Tab navigation and search input filter.
- */
-export default function InternshipsPage() {
-  const [cards, setCards] = useState(mockInternships);
-  const [activeTab, setActiveTab] = useState("Internships");
-  const [searchQuery, setSearchQuery] = useState("");
-  const [buttonSwipeDirection, setButtonSwipeDirection] = useState(null);
-  const [toastMessage, setToastMessage] = useState(null);
+const API_URL =
+  process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000/api";
 
-  const tabs = ["Internships", "Jobs", "Companies"];
+// Format stipend range or single amount
+function formatStipend(item) {
+  const min = item.stipendMin;
+  const max = item.stipendMax;
 
-  // Filter cards based on search query
-  const filteredCards = cards.filter(
-    (card) =>
-      card.roleTitle.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      card.companyName.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      card.skills.some((s) => s.toLowerCase().includes(searchQuery.toLowerCase()))
+  if (min != null && max != null) {
+    return `₹${Number(min).toLocaleString("en-IN")} - ₹${Number(
+      max
+    ).toLocaleString("en-IN")}`;
+  } else if (min != null) {
+    return `₹${Number(min).toLocaleString("en-IN")}`;
+  } else if (max != null) {
+    return `₹${Number(max).toLocaleString("en-IN")}`;
+  }
+  return "Not specified";
+}
+
+// Convert backend internship fields into the card format.
+function mapInternship(item) {
+  const min = item.stipendMin;
+  const max = item.stipendMax;
+
+  let stipend = "Not specified";
+
+  if (min != null && max != null) {
+    stipend = `${Number(min).toLocaleString("en-IN")} - ${Number(
+      max
+    ).toLocaleString("en-IN")}`;
+  } else if (min != null) {
+    stipend = Number(min).toLocaleString("en-IN");
+  } else if (max != null) {
+    stipend = Number(max).toLocaleString("en-IN");
+  }
+
+  return {
+    id: item._id,
+    companyName: item.company || "Unknown Company",
+    companyLogoText: item.company?.toUpperCase() || "COMPANY",
+    companyLogoSubText: "",
+    roleTitle: item.role || "Internship",
+    location: item.location || "Location not specified",
+    mode: item.mode || "onsite",
+    stipend,
+    duration: item.duration || "Not specified",
+    skills: Array.isArray(item.skills) ? item.skills : [],
+    isVerified: Boolean(item.isVerified),
+    jobType: item.employmentType || "Internship",
+    postedTime: item.createdAt
+      ? new Date(item.createdAt).toLocaleDateString("en-IN")
+      : "Recently posted",
+    description:
+      item.responsibilities || "No description available.",
+    applicationUrl: item.applicationUrl || "",
+  };
+}
+
+// Persist an internship action through the authenticated backend API.
+async function saveInternshipAction(internshipId, action) {
+  const token = sessionStorage.getItem("token");
+
+  if (!token) {
+    throw new Error("Please log in before saving internship actions.");
+  }
+
+  const response = await fetch(
+    `${API_URL}/internship-actions/${internshipId}/action`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ action }),
+    }
   );
 
-  // Show action feedback toast
+  const result = await response.json();
+
+  if (!response.ok || !result.success) {
+    throw new Error(result.message || "Unable to save internship action.");
+  }
+
+  return result.data;
+}
+
+// Read this user's previous actions so acted-on cards stay out of the deck
+// after a refresh. If no token is available, the public feed still loads.
+async function getActionedInternshipIds() {
+  const token = sessionStorage.getItem("token");
+  if (!token) return new Set();
+
+  try {
+    const response = await fetch(`${API_URL}/internship-actions/my-actions`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    if (!response.ok) return new Set();
+
+    const result = await response.json();
+    if (!result.success || !Array.isArray(result.data)) return new Set();
+
+    return new Set(
+      result.data
+        .filter(
+          (item) =>
+            item.decision === "accepted" ||
+            item.decision === "rejected" ||
+            item.saved === true
+        )
+        .map((item) => {
+          const internship = item.internship;
+          return typeof internship === "string" ? internship : internship?._id;
+        })
+        .filter(Boolean)
+    );
+  } catch (error) {
+    console.error("Unable to restore internship actions:", error);
+    return new Set();
+  }
+}
+
+const EMPTY_FILTERS = {
+  mode: "",
+  location: "",
+  skill: "",
+  verified: "",
+};
+
+export default function InternshipsPage() {
+  const [cards, setCards] = useState([]);
+  const [allInternships, setAllInternships] = useState([]);
+
+  const [activeTab, setActiveTab] = useState("Internships");
+  const [searchQuery, setSearchQuery] = useState("");
+
+  const [filters, setFilters] = useState({ ...EMPTY_FILTERS });
+  const [showFilters, setShowFilters] = useState(false);
+
+  const [buttonSwipeDirection, setButtonSwipeDirection] = useState(null);
+  const [toastMessage, setToastMessage] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [apiError, setApiError] = useState("");
+
+  const [myActions, setMyActions] = useState([]);
+  const [loadingActions, setLoadingActions] = useState(false);
+
+  // Fetch user's saved and accepted actions
+  const fetchMyActions = useCallback(async () => {
+    const token = sessionStorage.getItem("token");
+    if (!token) {
+      setMyActions([]);
+      return;
+    }
+
+    try {
+      setLoadingActions(true);
+      const response = await fetch(`${API_URL}/internship-actions/my-actions`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      if (!response.ok) return;
+
+      const result = await response.json();
+      if (result.success && Array.isArray(result.data)) {
+        setMyActions(result.data);
+      }
+    } catch (error) {
+      console.error("Failed to load user actions:", error);
+    } finally {
+      setLoadingActions(false);
+    }
+  }, []);
+
+  // Fetch internships using the backend-supported query parameters.
+  const fetchInternships = useCallback(async (filterValues = {}) => {
+    try {
+      setLoading(true);
+      setApiError("");
+      setButtonSwipeDirection(null);
+
+      const params = new URLSearchParams();
+
+      if (filterValues.mode) {
+        params.set("mode", filterValues.mode);
+      }
+
+      if (filterValues.location?.trim()) {
+        params.set("location", filterValues.location.trim());
+      }
+
+      if (filterValues.skill?.trim()) {
+        params.set("skill", filterValues.skill.trim());
+      }
+
+      if (filterValues.verified) {
+        params.set("verified", filterValues.verified);
+      }
+
+      if (filterValues.search?.trim()) {
+        params.set("search", filterValues.search.trim());
+      }
+
+      const queryString = params.toString();
+      const url = `${API_URL}/internships${
+        queryString ? `?${queryString}` : ""
+      }`;
+
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        throw new Error(`HTTP error: ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      if (!data.success || !Array.isArray(data.data)) {
+        throw new Error("Invalid API response");
+      }
+
+      const mapped = data.data
+        .filter((item) => item._id)
+        .map(mapInternship);
+
+      const actionedIds = await getActionedInternshipIds();
+
+      setAllInternships(mapped);
+      setCards(mapped.filter((item) => !actionedIds.has(item.id)));
+    } catch (error) {
+      console.error("Failed to fetch internships:", error);
+      setApiError(
+        "Unable to load internships. Please verify the backend API server is reachable."
+      );
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchInternships();
+    fetchMyActions();
+  }, [fetchInternships, fetchMyActions]);
+
+  // Local search keeps the displayed cards responsive while typing.
+  const query = searchQuery.trim().toLowerCase();
+
+  const filteredCards = cards.filter((card) => {
+    if (!query) return true;
+
+    return (
+      card.roleTitle.toLowerCase().includes(query) ||
+      card.companyName.toLowerCase().includes(query) ||
+      card.skills.some((skill) => skill.toLowerCase().includes(query))
+    );
+  });
+
+  // Filtered saved and accepted items
+  const savedItems = myActions.filter(
+    (item) => item.saved && item.internship && typeof item.internship === "object"
+  );
+  const acceptedItems = myActions.filter(
+    (item) =>
+      item.decision === "accepted" &&
+      item.internship &&
+      typeof item.internship === "object"
+  );
+
+  const filteredSavedItems = savedItems.filter((item) => {
+    if (!query) return true;
+    const intern = item.internship;
+    const role = (intern.role || "").toLowerCase();
+    const company = (intern.company || "").toLowerCase();
+    const skills = Array.isArray(intern.skills) ? intern.skills : [];
+    return (
+      role.includes(query) ||
+      company.includes(query) ||
+      skills.some((s) => s.toLowerCase().includes(query))
+    );
+  });
+
+  const filteredAcceptedItems = acceptedItems.filter((item) => {
+    if (!query) return true;
+    const intern = item.internship;
+    const role = (intern.role || "").toLowerCase();
+    const company = (intern.company || "").toLowerCase();
+    const skills = Array.isArray(intern.skills) ? intern.skills : [];
+    return (
+      role.includes(query) ||
+      company.includes(query) ||
+      skills.some((s) => s.toLowerCase().includes(query))
+    );
+  });
+
+  const tabs = [
+    { id: "Internships", label: "Discovery Deck" },
+    { id: "Saved", label: `Saved (${savedItems.length})` },
+    { id: "Accepted", label: `Accepted (${acceptedItems.length})` },
+    { id: "Jobs", label: "Jobs" },
+    { id: "Companies", label: "Companies" },
+  ];
+
   const showToast = (message) => {
     setToastMessage(message);
-    setTimeout(() => setToastMessage(null), 2500);
-  };
 
-  // Handle card swipe (drag release or button trigger)
-  const handleCardSwipe = (direction) => {
-    if (cards.length === 0) return;
-
-    const activeCard = cards[0];
-    let actionLabel = "";
-    if (direction === "right") actionLabel = `Accepted ${activeCard.roleTitle}`;
-    else if (direction === "left") actionLabel = `Passed on ${activeCard.roleTitle}`;
-    else if (direction === "save") actionLabel = `Saved ${activeCard.roleTitle}`;
-
-    showToast(actionLabel);
-
-    // Remove top card from state
-    setCards((prevCards) => prevCards.slice(1));
-    setButtonSwipeDirection(null);
-  };
-
-  // Trigger swipe animation from action buttons
-  const triggerButtonSwipe = (direction) => {
-    if (cards.length === 0 || buttonSwipeDirection) return;
-    setButtonSwipeDirection(direction);
     setTimeout(() => {
-      handleCardSwipe(direction);
-    }, 300);
+      setToastMessage("");
+    }, 2500);
   };
 
-  // Reload internships when deck is empty
-  const handleReloadDeck = () => {
-    setCards(mockInternships);
-    setSearchQuery("");
-    showToast("Reloaded internship deck!");
+  // Persist card swipes before removing cards from the current deck.
+  const handleCardSwipe = async (direction) => {
+    if (buttonSwipeDirection) return;
+
+    const activeCard = filteredCards[0];
+    if (!activeCard) return;
+
+    const actionMap = {
+      right: "accepted",
+      left: "rejected",
+      save: "saved",
+    };
+    const action = actionMap[direction];
+    if (!action) return;
+
+    try {
+      await saveInternshipAction(activeCard.id, action);
+
+      const messages = {
+        right: `Interested in ${activeCard.roleTitle}`,
+        left: `Passed on ${activeCard.roleTitle}`,
+        save: `Saved ${activeCard.roleTitle}`,
+      };
+      showToast(messages[direction]);
+      setCards((previousCards) =>
+        previousCards.filter((card) => card.id !== activeCard.id)
+      );
+      fetchMyActions();
+    } catch (error) {
+      showToast(error.message || "Unable to save internship action.");
+    }
   };
+
+  // Persist button actions and keep the existing swipe animation.
+  const triggerButtonSwipe = async (direction) => {
+    if (
+      loading ||
+      apiError ||
+      !filteredCards.length ||
+      buttonSwipeDirection
+    ) {
+      return;
+    }
+
+    const activeCard = filteredCards[0];
+    const actionMap = {
+      right: "accepted",
+      left: "rejected",
+      save: "saved",
+    };
+    const action = actionMap[direction];
+    if (!action) return;
+
+    setButtonSwipeDirection(direction);
+
+    try {
+      await saveInternshipAction(activeCard.id, action);
+
+      const messages = {
+        right: `Interested in ${activeCard.roleTitle}`,
+        left: `Passed on ${activeCard.roleTitle}`,
+        save: `Saved ${activeCard.roleTitle}`,
+      };
+      showToast(messages[direction]);
+      setCards((previousCards) =>
+        previousCards.filter((card) => card.id !== activeCard.id)
+      );
+      fetchMyActions();
+    } catch (error) {
+      showToast(error.message || "Unable to save internship action.");
+    } finally {
+      setButtonSwipeDirection(null);
+    }
+  };
+
+  // Unsave an internship and update views
+  const handleUnsave = async (internshipId, roleTitle) => {
+    try {
+      await saveInternshipAction(internshipId, "unsaved");
+      showToast(`Removed "${roleTitle}" from saved`);
+      await fetchMyActions();
+      await fetchInternships();
+    } catch (error) {
+      showToast(error.message || "Unable to unsave internship.");
+    }
+  };
+
+  // Accept / express interest from saved view
+  const handleAcceptFromSaved = async (internshipId, roleTitle) => {
+    try {
+      await saveInternshipAction(internshipId, "accepted");
+      showToast(`Interested in "${roleTitle}"`);
+      await fetchMyActions();
+      await fetchInternships();
+    } catch (error) {
+      showToast(error.message || "Unable to accept internship.");
+    }
+  };
+
+  // Apply the selected filters and search term.
+  const handleApplyFilters = async () => {
+    setShowFilters(false);
+
+    await fetchInternships({
+      ...filters,
+      search: searchQuery,
+    });
+  };
+
+  // Clear filters and reload the default listing.
+  const handleResetFilters = async () => {
+    setFilters({ ...EMPTY_FILTERS });
+    setSearchQuery("");
+    setShowFilters(false);
+
+    await fetchInternships();
+  };
+
+  // Reload the current listing without filters.
+  const handleReloadDeck = async () => {
+    setSearchQuery("");
+    setFilters({ ...EMPTY_FILTERS });
+
+    await fetchInternships();
+    await fetchMyActions();
+  };
+
+  const actionsDisabled =
+    loading || Boolean(apiError) || filteredCards.length === 0;
 
   return (
     <div className="min-h-screen bg-[#F5F5F5] flex">
-      {/* ──── Left Sidebar ──── */}
       <DashboardSidebar />
 
-      {/* ──── Main Content Area ──── */}
-      <div className="flex-1 ml-[220px] flex flex-col min-h-screen relative">
-        {/* ──── Top Header Bar ──── */}
+      <div className="flex-1 md:ml-[220px] ml-0 flex flex-col min-h-screen relative">
         <DashboardHeader />
 
-        {/* ──── Toast Notification ──── */}
+        {/* Toast notifications */}
         <AnimatePresence>
           {toastMessage && (
             <motion.div
               initial={{ opacity: 0, y: -20, scale: 0.95 }}
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, y: -10, scale: 0.95 }}
-              className="absolute top-20 left-1/2 -translate-x-1/2 z-50 bg-gray-900/90 text-white text-xs font-semibold px-4 py-2 rounded-full shadow-lg backdrop-blur-xs flex items-center gap-2"
+              className="absolute top-20 left-1/2 -translate-x-1/2 z-50 bg-gray-900/90 text-white text-xs font-semibold px-4 py-2 rounded-full shadow-lg flex items-center gap-2"
             >
               <Sparkles className="w-3.5 h-3.5 text-[#2EB89D]" />
               {toastMessage}
@@ -108,23 +489,31 @@ export default function InternshipsPage() {
           )}
         </AnimatePresence>
 
-        {/* ──── Main Feed Section ──── */}
         <main className="flex-1 flex flex-col items-center px-4 sm:px-6 py-6 overflow-y-auto">
-          {/* ──── Search Bar ──── */}
+          {/* Search bar */}
           <div className="w-full max-w-[600px] flex items-center gap-3 mb-6">
             <div className="relative flex-1">
               <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400 pointer-events-none" />
+
               <input
                 id="internship-search"
                 type="text"
-                placeholder="search for internships, jobs, companies..."
+                placeholder="Search internships, jobs, companies..."
                 value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full pl-12 pr-4 py-3 bg-white border border-gray-200 rounded-full text-sm text-gray-700 placeholder:text-gray-400 focus:outline-none focus:border-[#2EB89D] focus:ring-2 focus:ring-[#2EB89D]/10 shadow-sm transition-all"
+                onChange={(event) => setSearchQuery(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    handleApplyFilters();
+                  }
+                }}
+                className="w-full pl-12 pr-10 py-3 bg-white border border-gray-200 rounded-full text-sm text-gray-700 placeholder:text-gray-400 focus:outline-none focus:border-[#2EB89D] focus:ring-2 focus:ring-[#2EB89D]/10 shadow-sm transition-all"
               />
+
               {searchQuery && (
                 <button
+                  type="button"
                   onClick={() => setSearchQuery("")}
+                  aria-label="Clear search"
                   className="absolute right-4 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 cursor-pointer"
                 >
                   <X className="w-4 h-4" />
@@ -132,157 +521,670 @@ export default function InternshipsPage() {
               )}
             </div>
 
-            {/* Filter Button */}
-            <button
-              id="filter-btn"
-              aria-label="Filters"
-              className="w-11 h-11 rounded-full bg-white border border-gray-200 flex items-center justify-center text-gray-500 hover:text-gray-700 hover:border-gray-300 shadow-sm transition-all cursor-pointer"
-            >
-              <SlidersHorizontal className="w-5 h-5" />
-            </button>
+            {activeTab === "Internships" && (
+              <button
+                id="filter-btn"
+                type="button"
+                aria-label="Toggle filters"
+                aria-expanded={showFilters}
+                onClick={() => setShowFilters((previous) => !previous)}
+                className={`w-11 h-11 rounded-full border flex items-center justify-center shadow-sm transition-all cursor-pointer ${
+                  showFilters
+                    ? "bg-[#E6F7F3] border-[#2EB89D] text-[#2EB89D]"
+                    : "bg-white border-gray-200 text-gray-500 hover:text-gray-700 hover:border-gray-300"
+                }`}
+              >
+                <SlidersHorizontal className="w-5 h-5" />
+              </button>
+            )}
           </div>
 
-          {/* ──── Tab Toggles ──── */}
-          <div className="flex items-center gap-3 mb-8">
+          {/* Filter panel (Discovery Feed only) */}
+          <AnimatePresence>
+            {activeTab === "Internships" && showFilters && (
+              <motion.div
+                initial={{ opacity: 0, height: 0, y: -8 }}
+                animate={{ opacity: 1, height: "auto", y: 0 }}
+                exit={{ opacity: 0, height: 0, y: -8 }}
+                className="w-full max-w-[600px] overflow-hidden mb-6"
+              >
+                <div className="bg-white border border-gray-200 rounded-2xl p-5 shadow-sm">
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="font-bold text-gray-900">
+                      Filter Internships
+                    </h3>
+
+                    <button
+                      type="button"
+                      onClick={() => setShowFilters(false)}
+                      aria-label="Close filters"
+                      className="text-gray-400 hover:text-gray-700"
+                    >
+                      <X className="w-5 h-5" />
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    {/* Work mode */}
+                    <div>
+                      <label
+                        htmlFor="filter-mode"
+                        className="block text-xs font-semibold text-gray-600 mb-2"
+                      >
+                        Work Mode
+                      </label>
+
+                      <select
+                        id="filter-mode"
+                        value={filters.mode}
+                        onChange={(event) =>
+                          setFilters((previous) => ({
+                            ...previous,
+                            mode: event.target.value,
+                          }))
+                        }
+                        className="w-full rounded-xl border border-gray-200 px-3 py-2.5 text-sm text-gray-700 bg-white focus:outline-none focus:border-[#2EB89D]"
+                      >
+                        <option value="">All modes</option>
+                        <option value="remote">Remote</option>
+                        <option value="hybrid">Hybrid</option>
+                        <option value="onsite">On-site</option>
+                      </select>
+                    </div>
+
+                    {/* Location */}
+                    <div>
+                      <label
+                        htmlFor="filter-location"
+                        className="block text-xs font-semibold text-gray-600 mb-2"
+                      >
+                        Location
+                      </label>
+
+                      <input
+                        id="filter-location"
+                        type="text"
+                        value={filters.location}
+                        onChange={(event) =>
+                          setFilters((previous) => ({
+                            ...previous,
+                            location: event.target.value,
+                          }))
+                        }
+                        placeholder="e.g. Noida, Remote"
+                        className="w-full rounded-xl border border-gray-200 px-3 py-2.5 text-sm text-gray-700 focus:outline-none focus:border-[#2EB89D]"
+                      />
+                    </div>
+
+                    {/* Skills */}
+                    <div>
+                      <label
+                        htmlFor="filter-skill"
+                        className="block text-xs font-semibold text-gray-600 mb-2"
+                      >
+                        Skill
+                      </label>
+
+                      <input
+                        id="filter-skill"
+                        type="text"
+                        value={filters.skill}
+                        onChange={(event) =>
+                          setFilters((previous) => ({
+                            ...previous,
+                            skill: event.target.value,
+                          }))
+                        }
+                        placeholder="e.g. React, Java, Python"
+                        className="w-full rounded-xl border border-gray-200 px-3 py-2.5 text-sm text-gray-700 focus:outline-none focus:border-[#2EB89D]"
+                      />
+                    </div>
+
+                    {/* Verification */}
+                    <div>
+                      <label
+                        htmlFor="filter-verified"
+                        className="block text-xs font-semibold text-gray-600 mb-2"
+                      >
+                        Company Verification
+                      </label>
+
+                      <select
+                        id="filter-verified"
+                        value={filters.verified}
+                        onChange={(event) =>
+                          setFilters((previous) => ({
+                            ...previous,
+                            verified: event.target.value,
+                          }))
+                        }
+                        className="w-full rounded-xl border border-gray-200 px-3 py-2.5 text-sm text-gray-700 bg-white focus:outline-none focus:border-[#2EB89D]"
+                      >
+                        <option value="">All companies</option>
+                        <option value="true">Verified only</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* Filter actions */}
+                  <div className="flex gap-3 mt-5">
+                    <button
+                      type="button"
+                      onClick={handleResetFilters}
+                      disabled={loading}
+                      className="flex-1 rounded-full border border-gray-200 px-4 py-2.5 text-sm font-semibold text-gray-600 hover:bg-gray-50 disabled:opacity-50"
+                    >
+                      Reset
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={handleApplyFilters}
+                      disabled={loading}
+                      className="flex-1 rounded-full bg-[#2EB89D] px-4 py-2.5 text-sm font-semibold text-white hover:bg-[#269a83] disabled:opacity-50"
+                    >
+                      {loading ? "Applying..." : "Apply Filters"}
+                    </button>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Navigation Tabs */}
+          <div className="flex items-center flex-wrap justify-center gap-2.5 mb-8">
             {tabs.map((tab) => (
               <button
-                key={tab}
-                id={`tab-${tab.toLowerCase()}`}
-                onClick={() => setActiveTab(tab)}
-                className={`px-6 py-2 rounded-full text-sm font-semibold transition-all duration-200 cursor-pointer ${
-                  activeTab === tab
+                key={tab.id}
+                id={`tab-${tab.id.toLowerCase()}`}
+                type="button"
+                onClick={() => setActiveTab(tab.id)}
+                className={`px-5 py-2 rounded-full text-sm font-semibold transition-all duration-200 cursor-pointer ${
+                  activeTab === tab.id
                     ? "bg-[#2EB89D] text-white shadow-md shadow-[#2EB89D]/20"
                     : "bg-white text-gray-700 border border-gray-200 hover:border-gray-300 hover:bg-gray-50 shadow-sm"
                 }`}
               >
-                {tab}
+                {tab.label}
               </button>
             ))}
           </div>
 
-          {/* ──── Swipeable Card Stack Deck ──── */}
-          <div className="relative w-full max-w-[480px] h-[470px] mb-8 flex items-center justify-center">
-            {filteredCards.length > 0 ? (
-              <AnimatePresence>
-                {filteredCards.slice(0, 3).map((internship, index) => {
-                  const isTop = index === 0;
+          {/* ──────────────── TAB CONTENT ──────────────── */}
+          {activeTab === "Internships" ? (
+            <>
+              {/* Internship Swipe Deck */}
+              <div className="relative w-full max-w-[480px] h-[470px] mb-8 flex items-center justify-center">
+                {loading ? (
+                  <div className="flex flex-col items-center gap-3 text-sm text-gray-500">
+                    <div className="w-8 h-8 border-4 border-[#2EB89D]/20 border-t-[#2EB89D] rounded-full animate-spin" />
+                    Loading internships...
+                  </div>
+                ) : apiError ? (
+                  <div className="w-full bg-white rounded-2xl p-8 text-center shadow-lg">
+                    <p className="text-sm text-red-600 mb-5">{apiError}</p>
+
+                    <button
+                      type="button"
+                      onClick={() => fetchInternships()}
+                      className="px-6 py-2.5 rounded-full bg-[#2EB89D] text-white text-sm font-semibold hover:bg-[#269a83]"
+                    >
+                      Try Again
+                    </button>
+                  </div>
+                ) : filteredCards.length > 0 ? (
+                  <AnimatePresence>
+                    {filteredCards.slice(0, 3).map((internship, index) => (
+                      <InternshipCard
+                        key={internship.id}
+                        internship={internship}
+                        isTopCard={index === 0}
+                        indexOffset={index}
+                        onSwipe={handleCardSwipe}
+                        swipeDirection={
+                          index === 0 ? buttonSwipeDirection : null
+                        }
+                      />
+                    ))}
+                  </AnimatePresence>
+                ) : (
+                  <motion.div
+                    initial={{ opacity: 0, scale: 0.9 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    className="w-full max-w-[480px] bg-white rounded-2xl p-8 border border-gray-100 shadow-xl shadow-black/5 flex flex-col items-center text-center"
+                  >
+                    <div className="w-16 h-16 rounded-full bg-[#E6F7F3] border border-[#2EB89D]/20 flex items-center justify-center text-[#2EB89D] mb-4">
+                      <Sparkles className="w-8 h-8" />
+                    </div>
+
+                    <h3 className="text-xl font-bold text-gray-900 mb-1">
+                      {searchQuery ? "No matches found" : "All caught up! 🎉"}
+                    </h3>
+
+                    <p className="text-sm text-gray-500 max-w-[320px] mb-6 leading-relaxed">
+                      {searchQuery
+                        ? "Try another company, role, or skill."
+                        : "No more new internships in the discovery deck. View your Saved or Accepted tabs above, or reload."}
+                    </p>
+
+                    <button
+                      id="reload-deck-btn"
+                      type="button"
+                      onClick={handleReloadDeck}
+                      className="px-6 py-2.5 rounded-full bg-[#2EB89D] text-white text-sm font-semibold hover:bg-[#269a83] active:scale-95 shadow-md shadow-[#2EB89D]/25 transition-all duration-200 flex items-center gap-2 cursor-pointer"
+                    >
+                      <RotateCcw className="w-4 h-4" />
+                      Reload Internships
+                    </button>
+                  </motion.div>
+                )}
+              </div>
+
+              {/* Action buttons */}
+              <div className="flex items-center gap-8 mb-8">
+                {/* Reject */}
+                <div className="flex flex-col items-center gap-1.5">
+                  <button
+                    id="action-reject"
+                    type="button"
+                    onClick={() => triggerButtonSwipe("left")}
+                    disabled={actionsDisabled}
+                    aria-label="Reject internship"
+                    className={`w-14 h-14 rounded-full bg-white border-2 border-red-400 flex items-center justify-center text-red-400 shadow-md shadow-red-100/50 transition-all duration-200 ${
+                      actionsDisabled
+                        ? "opacity-40 cursor-not-allowed"
+                        : "hover:bg-red-50 hover:scale-110 active:scale-95 cursor-pointer"
+                    }`}
+                  >
+                    <X className="w-6 h-6" strokeWidth={2.5} />
+                  </button>
+                  <span className="text-xs text-gray-500 font-medium">
+                    Reject
+                  </span>
+                </div>
+
+                {/* Save */}
+                <div className="flex flex-col items-center gap-1.5">
+                  <button
+                    id="action-save"
+                    type="button"
+                    onClick={() => triggerButtonSwipe("save")}
+                    disabled={actionsDisabled}
+                    aria-label="Save internship"
+                    className={`w-14 h-14 rounded-full bg-white border-2 border-gray-300 flex items-center justify-center text-gray-400 shadow-md shadow-gray-100/50 transition-all duration-200 ${
+                      actionsDisabled
+                        ? "opacity-40 cursor-not-allowed"
+                        : "hover:bg-gray-50 hover:border-gray-400 hover:text-gray-600 hover:scale-110 active:scale-95 cursor-pointer"
+                    }`}
+                  >
+                    <Bookmark className="w-6 h-6" strokeWidth={2} />
+                  </button>
+                  <span className="text-xs text-gray-500 font-medium">
+                    Save
+                  </span>
+                </div>
+
+                {/* Accept */}
+                <div className="flex flex-col items-center gap-1.5">
+                  <button
+                    id="action-accept"
+                    type="button"
+                    onClick={() => triggerButtonSwipe("right")}
+                    disabled={actionsDisabled}
+                    aria-label="Accept internship"
+                    className={`w-14 h-14 rounded-full bg-white border-2 border-[#2EB89D] flex items-center justify-center text-[#2EB89D] shadow-md shadow-[#2EB89D]/10 transition-all duration-200 ${
+                      actionsDisabled
+                        ? "opacity-40 cursor-not-allowed"
+                        : "hover:bg-[#E6F7F3] hover:scale-110 active:scale-95 cursor-pointer"
+                    }`}
+                  >
+                    <Check className="w-6 h-6" strokeWidth={2.5} />
+                  </button>
+                  <span className="text-xs text-gray-500 font-medium">
+                    Accept
+                  </span>
+                </div>
+              </div>
+
+              {/* Progress indicators */}
+              <div className="flex items-center gap-1.5 mb-4">
+                {allInternships.map((internship) => {
+                  const isRemaining = cards.some(
+                    (card) => card.id === internship.id
+                  );
+
+                  const isCurrent =
+                    filteredCards.length > 0 &&
+                    filteredCards[0].id === internship.id;
+
                   return (
-                    <InternshipCard
+                    <div
                       key={internship.id}
-                      internship={internship}
-                      isTopCard={isTop}
-                      indexOffset={index}
-                      onSwipe={handleCardSwipe}
-                      swipeDirection={isTop ? buttonSwipeDirection : null}
+                      title={internship.roleTitle}
+                      className={`h-1.5 rounded-full transition-all duration-300 ${
+                        isCurrent
+                          ? "w-6 bg-[#2EB89D]"
+                          : !isRemaining
+                          ? "w-1.5 bg-[#2EB89D]/40"
+                          : "w-1.5 bg-gray-200"
+                      }`}
                     />
                   );
                 })}
-              </AnimatePresence>
-            ) : (
-              /* ──── Empty State Card ──── */
-              <motion.div
-                initial={{ opacity: 0, scale: 0.9 }}
-                animate={{ opacity: 1, scale: 1 }}
-                className="w-full max-w-[480px] bg-white rounded-2xl p-8 border border-gray-100 shadow-xl shadow-black/5 flex flex-col items-center text-center"
-              >
-                <div className="w-16 h-16 rounded-full bg-[#E6F7F3] border border-[#2EB89D]/20 flex items-center justify-center text-[#2EB89D] mb-4">
-                  <Sparkles className="w-8 h-8" />
+              </div>
+            </>
+          ) : activeTab === "Saved" ? (
+            /* ──────────────── SAVED INTERNSHIPS VIEW ──────────────── */
+            <div className="w-full max-w-[720px] flex flex-col gap-4 mb-8">
+              <div className="flex items-center justify-between mb-2">
+                <div>
+                  <h2 className="text-xl font-bold text-gray-900">
+                    Saved Internships
+                  </h2>
+                  <p className="text-xs text-gray-500">
+                    Opportunities you bookmarked to review or apply later.
+                  </p>
                 </div>
-                <h3 className="text-xl font-bold text-gray-900 mb-1">
-                  All caught up! 🎉
-                </h3>
-                <p className="text-sm text-gray-500 max-w-[320px] mb-6 leading-relaxed">
-                  No more internships right now. You can reload the list to review the opportunities again.
-                </p>
-                <button
-                  id="reload-deck-btn"
-                  onClick={handleReloadDeck}
-                  className="px-6 py-2.5 rounded-full bg-[#2EB89D] text-white text-sm font-semibold hover:bg-[#269a83] active:scale-95 shadow-md shadow-[#2EB89D]/25 transition-all duration-200 flex items-center gap-2 cursor-pointer"
-                >
-                  <RotateCcw className="w-4 h-4" />
-                  Reload Internships
-                </button>
-              </motion.div>
-            )}
-          </div>
+                <span className="text-xs font-semibold bg-[#E6F7F3] text-[#2EB89D] px-3 py-1 rounded-full">
+                  {filteredSavedItems.length} Saved
+                </span>
+              </div>
 
-          {/* ──── Action Controls ──── */}
-          <div className="flex items-center gap-8 mb-8">
-            {/* Reject */}
-            <div className="flex flex-col items-center gap-1.5">
-              <button
-                id="action-reject"
-                onClick={() => triggerButtonSwipe("left")}
-                disabled={filteredCards.length === 0}
-                aria-label="Reject internship"
-                className={`w-14 h-14 rounded-full bg-white border-2 border-red-400 flex items-center justify-center text-red-400 shadow-md shadow-red-100/50 transition-all duration-200 cursor-pointer ${
-                  filteredCards.length === 0
-                    ? "opacity-40 cursor-not-allowed"
-                    : "hover:bg-red-50 hover:scale-110 active:scale-95"
-                }`}
-              >
-                <X className="w-6 h-6" strokeWidth={2.5} />
-              </button>
-              <span className="text-xs text-gray-500 font-medium">Reject</span>
+              {loadingActions ? (
+                <div className="py-16 flex flex-col items-center justify-center gap-3 text-sm text-gray-500">
+                  <div className="w-8 h-8 border-4 border-[#2EB89D]/20 border-t-[#2EB89D] rounded-full animate-spin" />
+                  Loading your saved internships...
+                </div>
+              ) : filteredSavedItems.length > 0 ? (
+                filteredSavedItems.map((item) => {
+                  const intern = item.internship;
+                  const isAccepted = item.decision === "accepted";
+
+                  return (
+                    <motion.div
+                      key={intern._id}
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="bg-white rounded-2xl p-5 border border-gray-200 shadow-sm hover:shadow-md transition-shadow flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4"
+                    >
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1">
+                          <h3 className="font-bold text-gray-900 text-base truncate">
+                            {intern.role || "Internship"}
+                          </h3>
+                          {intern.isVerified && (
+                            <span className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-[#2EB89D] bg-[#E6F7F3] px-2 py-0.5 rounded-full">
+                              <BadgeCheck className="w-3 h-3" />
+                              Verified
+                            </span>
+                          )}
+                        </div>
+
+                        <p className="text-sm font-medium text-gray-600 mb-2">
+                          {intern.company || "Company"}
+                        </p>
+
+                        <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs text-gray-500 mb-3">
+                          <span className="inline-flex items-center gap-1">
+                            <Monitor className="w-3.5 h-3.5 text-gray-400" />
+                            {intern.mode || "remote"}
+                          </span>
+                          <span className="inline-flex items-center gap-1">
+                            <MapPin className="w-3.5 h-3.5 text-gray-400" />
+                            {intern.location || "Remote"}
+                          </span>
+                          <span className="inline-flex items-center gap-1">
+                            <Wallet className="w-3.5 h-3.5 text-gray-400" />
+                            {formatStipend(intern)}
+                          </span>
+                          <span className="inline-flex items-center gap-1">
+                            <CalendarDays className="w-3.5 h-3.5 text-gray-400" />
+                            {intern.duration || "N/A"}
+                          </span>
+                        </div>
+
+                        {/* Skills */}
+                        {Array.isArray(intern.skills) && intern.skills.length > 0 && (
+                          <div className="flex flex-wrap gap-1.5">
+                            {intern.skills.slice(0, 4).map((skill) => (
+                              <span
+                                key={skill}
+                                className="text-[10px] font-semibold text-[#2EB89D] bg-[#E6F7F3] px-2.5 py-0.5 rounded-full"
+                              >
+                                {skill}
+                              </span>
+                            ))}
+                            {intern.skills.length > 4 && (
+                              <span className="text-[10px] text-gray-400 self-center">
+                                +{intern.skills.length - 4} more
+                              </span>
+                            )}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Action buttons */}
+                      <div className="flex items-center gap-2 self-end sm:self-center shrink-0">
+                        {isAccepted ? (
+                          <span className="text-xs font-semibold text-[#2EB89D] bg-[#E6F7F3] px-3.5 py-2 rounded-full flex items-center gap-1.5 border border-[#2EB89D]/20">
+                            <CheckCircle className="w-4 h-4" />
+                            Accepted
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleAcceptFromSaved(intern._id, intern.role)
+                            }
+                            className="px-4 py-2 bg-[#2EB89D] text-white text-xs font-semibold rounded-full hover:bg-[#269a83] active:scale-95 transition-all shadow-sm shadow-[#2EB89D]/20 flex items-center gap-1.5 cursor-pointer"
+                          >
+                            <Check className="w-3.5 h-3.5" />
+                            Accept / Apply
+                          </button>
+                        )}
+
+                        {intern.applicationUrl && (
+                          <a
+                            href={intern.applicationUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="p-2 text-gray-500 hover:text-gray-800 hover:bg-gray-100 border border-gray-200 rounded-full transition-all"
+                            title="Visit external application portal"
+                          >
+                            <ExternalLink className="w-4 h-4" />
+                          </a>
+                        )}
+
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleUnsave(intern._id, intern.role)
+                          }
+                          className="px-3 py-2 text-red-500 hover:bg-red-50 hover:border-red-300 border border-red-200 text-xs font-semibold rounded-full transition-all flex items-center gap-1 cursor-pointer"
+                          title="Remove from saved"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          Unsave
+                        </button>
+                      </div>
+                    </motion.div>
+                  );
+                })
+              ) : (
+                <div className="bg-white rounded-2xl p-10 border border-gray-200 shadow-sm text-center flex flex-col items-center">
+                  <div className="w-14 h-14 rounded-full bg-[#E6F7F3] flex items-center justify-center text-[#2EB89D] mb-4">
+                    <Bookmark className="w-7 h-7" />
+                  </div>
+                  <h3 className="text-lg font-bold text-gray-900 mb-1">
+                    No saved internships
+                  </h3>
+                  <p className="text-sm text-gray-500 max-w-[320px] mb-5">
+                    Click the bookmark button on any internship card in the Discovery Deck to save it here.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab("Internships")}
+                    className="px-6 py-2.5 rounded-full bg-[#2EB89D] text-white text-sm font-semibold hover:bg-[#269a83] transition-all"
+                  >
+                    Go to Discovery Deck
+                  </button>
+                </div>
+              )}
             </div>
+          ) : activeTab === "Accepted" ? (
+            /* ──────────────── ACCEPTED INTERNSHIPS VIEW ──────────────── */
+            <div className="w-full max-w-[720px] flex flex-col gap-4 mb-8">
+              <div className="flex items-center justify-between mb-2">
+                <div>
+                  <h2 className="text-xl font-bold text-gray-900">
+                    Accepted / Interested Roles
+                  </h2>
+                  <p className="text-xs text-gray-500">
+                    Internships where you swiped right or accepted interest.
+                  </p>
+                </div>
+                <span className="text-xs font-semibold bg-[#E6F7F3] text-[#2EB89D] px-3 py-1 rounded-full">
+                  {filteredAcceptedItems.length} Accepted
+                </span>
+              </div>
 
-            {/* Save */}
-            <div className="flex flex-col items-center gap-1.5">
-              <button
-                id="action-save"
-                onClick={() => triggerButtonSwipe("save")}
-                disabled={filteredCards.length === 0}
-                aria-label="Save internship"
-                className={`w-14 h-14 rounded-full bg-white border-2 border-gray-300 flex items-center justify-center text-gray-400 shadow-md shadow-gray-100/50 transition-all duration-200 cursor-pointer ${
-                  filteredCards.length === 0
-                    ? "opacity-40 cursor-not-allowed"
-                    : "hover:bg-gray-50 hover:border-gray-400 hover:text-gray-600 hover:scale-110 active:scale-95"
-                }`}
-              >
-                <Bookmark className="w-6 h-6" strokeWidth={2} />
-              </button>
-              <span className="text-xs text-gray-500 font-medium">Save</span>
+              {loadingActions ? (
+                <div className="py-16 flex flex-col items-center justify-center gap-3 text-sm text-gray-500">
+                  <div className="w-8 h-8 border-4 border-[#2EB89D]/20 border-t-[#2EB89D] rounded-full animate-spin" />
+                  Loading your accepted internships...
+                </div>
+              ) : filteredAcceptedItems.length > 0 ? (
+                filteredAcceptedItems.map((item) => {
+                  const intern = item.internship;
+
+                  return (
+                    <motion.div
+                      key={intern._id}
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="bg-white rounded-2xl p-5 border border-gray-200 shadow-sm hover:shadow-md transition-shadow flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4"
+                    >
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1">
+                          <h3 className="font-bold text-gray-900 text-base truncate">
+                            {intern.role || "Internship"}
+                          </h3>
+                          {intern.isVerified && (
+                            <span className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-[#2EB89D] bg-[#E6F7F3] px-2 py-0.5 rounded-full">
+                              <BadgeCheck className="w-3 h-3" />
+                              Verified
+                            </span>
+                          )}
+                        </div>
+
+                        <p className="text-sm font-medium text-gray-600 mb-2">
+                          {intern.company || "Company"}
+                        </p>
+
+                        <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs text-gray-500 mb-3">
+                          <span className="inline-flex items-center gap-1">
+                            <Monitor className="w-3.5 h-3.5 text-gray-400" />
+                            {intern.mode || "remote"}
+                          </span>
+                          <span className="inline-flex items-center gap-1">
+                            <MapPin className="w-3.5 h-3.5 text-gray-400" />
+                            {intern.location || "Remote"}
+                          </span>
+                          <span className="inline-flex items-center gap-1">
+                            <Wallet className="w-3.5 h-3.5 text-gray-400" />
+                            {formatStipend(intern)}
+                          </span>
+                          <span className="inline-flex items-center gap-1">
+                            <CalendarDays className="w-3.5 h-3.5 text-gray-400" />
+                            {intern.duration || "N/A"}
+                          </span>
+                        </div>
+
+                        {/* Skills */}
+                        {Array.isArray(intern.skills) && intern.skills.length > 0 && (
+                          <div className="flex flex-wrap gap-1.5">
+                            {intern.skills.map((skill) => (
+                              <span
+                                key={skill}
+                                className="text-[10px] font-semibold text-[#2EB89D] bg-[#E6F7F3] px-2.5 py-0.5 rounded-full"
+                              >
+                                {skill}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Right Status / Links */}
+                      <div className="flex items-center gap-2 self-end sm:self-center shrink-0">
+                        <span className="text-xs font-semibold text-[#2EB89D] bg-[#E6F7F3] px-3.5 py-2 rounded-full flex items-center gap-1.5 border border-[#2EB89D]/20">
+                          <CheckCircle className="w-4 h-4" />
+                          Accepted / Interested
+                        </span>
+
+                        {intern.applicationUrl && (
+                          <a
+                            href={intern.applicationUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="px-4 py-2 bg-gray-900 hover:bg-gray-800 text-white text-xs font-semibold rounded-full transition-all flex items-center gap-1.5 shadow-sm"
+                          >
+                            <ExternalLink className="w-3.5 h-3.5" />
+                            Apply on Portal
+                          </a>
+                        )}
+                      </div>
+                    </motion.div>
+                  );
+                })
+              ) : (
+                <div className="bg-white rounded-2xl p-10 border border-gray-200 shadow-sm text-center flex flex-col items-center">
+                  <div className="w-14 h-14 rounded-full bg-[#E6F7F3] flex items-center justify-center text-[#2EB89D] mb-4">
+                    <CheckCircle className="w-7 h-7" />
+                  </div>
+                  <h3 className="text-lg font-bold text-gray-900 mb-1">
+                    No accepted internships yet
+                  </h3>
+                  <p className="text-sm text-gray-500 max-w-[320px] mb-5">
+                    Swipe right or click Accept on internships in the Discovery Deck to express interest.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab("Internships")}
+                    className="px-6 py-2.5 rounded-full bg-[#2EB89D] text-white text-sm font-semibold hover:bg-[#269a83] transition-all"
+                  >
+                    Go to Discovery Deck
+                  </button>
+                </div>
+              )}
             </div>
-
-            {/* Accept */}
-            <div className="flex flex-col items-center gap-1.5">
+          ) : (
+            /* ──────────────── JOBS / COMPANIES PLACEHOLDER ──────────────── */
+            <div className="w-full max-w-[600px] bg-white rounded-2xl p-10 border border-gray-200 shadow-sm text-center flex flex-col items-center mb-8">
+              <div className="w-14 h-14 rounded-full bg-[#E6F7F3] flex items-center justify-center text-[#2EB89D] mb-4">
+                {activeTab === "Jobs" ? (
+                  <Briefcase className="w-7 h-7" />
+                ) : (
+                  <Building2 className="w-7 h-7" />
+                )}
+              </div>
+              <h3 className="text-lg font-bold text-gray-900 mb-1">
+                {activeTab === "Jobs"
+                  ? "Jobs Feed Coming Soon"
+                  : "Company Directory Coming Soon"}
+              </h3>
+              <p className="text-sm text-gray-500 max-w-[320px] mb-5">
+                We are currently focusing on internship discovery. Check back soon for full-time {activeTab.toLowerCase()}.
+              </p>
               <button
-                id="action-accept"
-                onClick={() => triggerButtonSwipe("right")}
-                disabled={filteredCards.length === 0}
-                aria-label="Accept internship"
-                className={`w-14 h-14 rounded-full bg-white border-2 border-[#2EB89D] flex items-center justify-center text-[#2EB89D] shadow-md shadow-[#2EB89D]/10 transition-all duration-200 cursor-pointer ${
-                  filteredCards.length === 0
-                    ? "opacity-40 cursor-not-allowed"
-                    : "hover:bg-[#E6F7F3] hover:scale-110 active:scale-95"
-                }`}
+                type="button"
+                onClick={() => setActiveTab("Internships")}
+                className="px-6 py-2.5 rounded-full bg-[#2EB89D] text-white text-sm font-semibold hover:bg-[#269a83] transition-all"
               >
-                <Check className="w-6 h-6" strokeWidth={2.5} />
+                Back to Discovery Deck
               </button>
-              <span className="text-xs text-gray-500 font-medium">Accept</span>
             </div>
-          </div>
-
-          {/* Card counter progress dots */}
-          <div className="flex items-center gap-1.5 mb-4">
-            {mockInternships.map((card, i) => {
-              const isSwiped = !filteredCards.some((c) => c.id === card.id);
-              const isCurrent = filteredCards.length > 0 && filteredCards[0].id === card.id;
-
-              return (
-                <div
-                  key={card.id}
-                  className={`h-1.5 rounded-full transition-all duration-300 ${
-                    isCurrent
-                      ? "w-6 bg-[#2EB89D]"
-                      : isSwiped
-                      ? "w-1.5 bg-[#2EB89D]/40"
-                      : "w-1.5 bg-gray-200"
-                  }`}
-                />
-              );
-            })}
-          </div>
+          )}
         </main>
       </div>
     </div>
