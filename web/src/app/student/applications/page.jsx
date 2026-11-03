@@ -9,19 +9,26 @@ import {
   XCircle,
   Calendar,
   MessageSquare,
-  Building2,
   MapPin,
   ExternalLink,
   Search,
-  Filter,
-  ArrowRight,
   Briefcase,
   AlertCircle,
 } from "lucide-react";
 
 import DashboardSidebar from "@/components/DashboardSidebar";
 import DashboardHeader from "@/components/DashboardHeader";
+import CompanyLogo from "@/components/CompanyLogo";
 import { applicationService } from "@/services/apiClient";
+
+import {
+  tabs,
+  dateAppliedOptions,
+  tabSortOptions,
+  normalizeStatus,
+  sortApplications,
+  filterApplications,
+} from "@/lib/applicationFilters";
 
 const statusStyles = {
   Applied: {
@@ -36,7 +43,7 @@ const statusStyles = {
     bg: "bg-indigo-50 text-indigo-700 border-indigo-200",
     icon: CheckCircle2,
   },
-  Interviewing: {
+  Interview: {
     bg: "bg-purple-50 text-purple-700 border-purple-200",
     icon: Calendar,
   },
@@ -50,67 +57,115 @@ const statusStyles = {
   },
 };
 
+const getInternshipId = (internship, fallbackId) => {
+  if (!internship) return fallbackId || "";
+  if (typeof internship === "string") return internship;
+  return internship._id || internship.id || fallbackId || "";
+};
+
 export default function StudentApplicationsPage() {
   const [activeTab, setActiveTab] = useState("All");
   const [searchQuery, setSearchQuery] = useState("");
+  const [dateFilter, setDateFilter] = useState("any");
+  const [sortBy, setSortBy] = useState("recently_applied");
   const [applications, setApplications] = useState([]);
   const [loading, setLoading] = useState(true);
+
+  const handleTabChange = (newTab) => {
+    setActiveTab(newTab);
+    const availableSorts = tabSortOptions[newTab] || tabSortOptions.All;
+    if (!availableSorts.some((opt) => opt.value === sortBy)) {
+      setSortBy(availableSorts[0].value);
+    }
+  };
 
   useEffect(() => {
     let isMounted = true;
     setLoading(true);
-    applicationService.getMyApplications().then((res) => {
-      if (isMounted && res && Array.isArray(res)) {
-        const mapped = res.map((app) => ({
-          id: app._id || app.id,
-          internshipId: app.internship?._id || app.internshipId || "",
-          companyName: app.internship?.company || app.companyName || "Partner Company",
-          role: app.internship?.role || app.role || "Internship Role",
-          location: app.internship?.location || app.location || "Remote",
-          workType: app.internship?.mode || app.workType || "Remote",
-          stipend: app.internship?.stipendText || app.stipend || "Competitive",
-          appliedDate: app.createdAt
-            ? new Date(app.createdAt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
-            : "Recently",
-          status: app.status
-            ? app.status.charAt(0).toUpperCase() + app.status.slice(1).toLowerCase()
-            : "Applied",
-          stageNotes: app.notes || "Application submitted successfully.",
-          recruiterName: app.internship?.postedBy?.name || "Hiring Team",
-          recruiterRole: "Talent Acquisition",
-          skillsMatched: app.internship?.skills || [],
-          logo: app.internship?.companyLogo || "",
-        }));
-        setApplications(mapped);
-      }
-      setLoading(false);
-    }).catch(() => {
-      if (isMounted) setLoading(false);
-    });
+    applicationService
+      .getMyApplications()
+      .then((res) => {
+        if (isMounted && res && Array.isArray(res)) {
+          const mapped = res.map((app) => {
+            const internshipId = getInternshipId(app.internship, app.internshipId);
+            const internObj =
+              typeof app.internship === "object" && app.internship ? app.internship : null;
+
+            const createdTimestamp = app.createdAt ? new Date(app.createdAt).getTime() : 0;
+            const appliedTimestamp = app.appliedDate ? new Date(app.appliedDate).getTime() : 0;
+            const appliedAt =
+              !isNaN(createdTimestamp) && createdTimestamp > 0
+                ? createdTimestamp
+                : !isNaN(appliedTimestamp) && appliedTimestamp > 0
+                ? appliedTimestamp
+                : 0;
+
+            const updatedTimestamp = app.updatedAt ? new Date(app.updatedAt).getTime() : 0;
+            const updatedAt =
+              !isNaN(updatedTimestamp) && updatedTimestamp > 0
+                ? updatedTimestamp
+                : appliedAt;
+
+            const rawInterview = app.interviewDate ? new Date(app.interviewDate) : null;
+            const interviewTimestamp =
+              rawInterview && !isNaN(rawInterview.getTime()) ? rawInterview.getTime() : 0;
+
+            const dateObj = app.createdAt
+              ? new Date(app.createdAt)
+              : app.appliedDate
+              ? new Date(app.appliedDate)
+              : null;
+            const appliedDate =
+              dateObj && !isNaN(dateObj.getTime())
+                ? dateObj.toLocaleDateString("en-US", {
+                    month: "short",
+                    day: "numeric",
+                    year: "numeric",
+                  })
+                : "Recently";
+
+            return {
+              id: app._id || app.id,
+              internshipId,
+              companyName: internObj?.company || app.companyName || "Partner Company",
+              role: internObj?.role || app.roleTitle || app.role || "Internship Role",
+              location: internObj?.location || app.location || "Remote",
+              workType: internObj?.mode || app.workType || "Remote",
+              stipend: internObj?.stipendText || app.stipend || "Competitive",
+              appliedDate,
+              status: normalizeStatus(app.status),
+              rawStatus: app.status || "applied",
+              appliedAt,
+              updatedAt,
+              interviewDate: app.interviewDate || null,
+              interviewTimestamp,
+              stageNotes: app.notes || "Application submitted successfully.",
+              recruiterName: internObj?.postedBy?.name || "Hiring Team",
+              recruiterRole: "Talent Acquisition",
+              skillsMatched: internObj?.skills || [],
+              logo: internObj?.companyLogo || app.companyLogo || "",
+            };
+          });
+          setApplications(mapped);
+        }
+        setLoading(false);
+      })
+      .catch(() => {
+        if (isMounted) setLoading(false);
+      });
     return () => {
       isMounted = false;
     };
   }, []);
 
-  const tabs = [
-    "All",
-    "Applied",
-    "Reviewing",
-    "Shortlisted",
-    "Interviewing",
-    "Offered",
-    "Rejected",
-  ];
-
-  const filteredApplications = applications.filter((app) => {
-    const matchesTab = activeTab === "All" || app.status === activeTab;
-    const matchesSearch =
-      app.companyName.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      app.role.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      app.skillsMatched.some((s) => s.toLowerCase().includes(searchQuery.toLowerCase()));
-
-    return matchesTab && matchesSearch;
-  });
+  const filteredApplications = sortApplications(
+    filterApplications(applications, {
+      activeTab,
+      searchQuery,
+      dateFilter,
+    }),
+    sortBy
+  );
 
   return (
     <div className="min-h-screen bg-slate-50 flex">
@@ -156,7 +211,11 @@ export default function StudentApplicationsPage() {
                 In Active Stages
               </p>
               <p className="text-xl font-extrabold text-blue-600 mt-0.5">
-                {applications.filter((a) => ["Reviewing", "Shortlisted", "Interviewing"].includes(a.status)).length}
+                {
+                  applications.filter((a) =>
+                    ["Reviewing", "Shortlisted", "Interview"].includes(a.status)
+                  ).length
+                }
               </p>
             </div>
             <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-2xs">
@@ -177,9 +236,9 @@ export default function StudentApplicationsPage() {
             </div>
           </div>
 
-          {/* Search & Tabs */}
+          {/* Search, Sort & Tabs Bar */}
           <div className="bg-white rounded-2xl border border-slate-200 shadow-xs p-4 space-y-4">
-            <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-4">
+            <div className="flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-4">
               <div className="relative flex-1">
                 <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
                 <input
@@ -191,28 +250,79 @@ export default function StudentApplicationsPage() {
                 />
               </div>
 
-              {/* Status Tabs */}
-              <div className="flex items-center gap-1 overflow-x-auto pb-1 sm:pb-0 scrollbar-none">
-                {tabs.map((tab) => (
-                  <button
-                    key={tab}
-                    onClick={() => setActiveTab(tab)}
-                    className={`px-3 py-1.5 rounded-xl text-xs font-semibold whitespace-nowrap transition-colors cursor-pointer ${
-                      activeTab === tab
-                        ? "bg-[#4B9C93] text-white shadow-2xs"
-                        : "bg-slate-50 text-slate-600 hover:bg-slate-100"
-                    }`}
+              <div className="flex flex-wrap items-center gap-3">
+                {/* Date Applied Filter */}
+                <div className="flex items-center gap-2">
+                  <label
+                    htmlFor="date-applied-filter"
+                    className="text-xs font-semibold text-slate-500 whitespace-nowrap"
                   >
-                    {tab}
-                  </button>
-                ))}
+                    Date applied
+                  </label>
+                  <select
+                    id="date-applied-filter"
+                    value={dateFilter}
+                    onChange={(e) => setDateFilter(e.target.value)}
+                    className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-[#4B9C93] cursor-pointer"
+                  >
+                    {dateAppliedOptions.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Sort by */}
+                <div className="flex items-center gap-2">
+                  <label
+                    htmlFor="application-sort"
+                    className="text-xs font-semibold text-slate-500 whitespace-nowrap"
+                  >
+                    Sort by
+                  </label>
+                  <select
+                    id="application-sort"
+                    value={sortBy}
+                    onChange={(e) => setSortBy(e.target.value)}
+                    className="px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-700 focus:outline-none focus:ring-2 focus:ring-[#4B9C93] cursor-pointer"
+                  >
+                    {(tabSortOptions[activeTab] || tabSortOptions.All).map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
               </div>
+            </div>
+
+            {/* Status Tabs */}
+            <div className="flex items-center gap-1 overflow-x-auto pb-1 scrollbar-none border-t border-slate-100 pt-3">
+              {tabs.map((tab) => (
+                <button
+                  key={tab}
+                  onClick={() => handleTabChange(tab)}
+                  className={`px-3 py-1.5 rounded-xl text-xs font-semibold whitespace-nowrap transition-colors cursor-pointer ${
+                    activeTab === tab
+                      ? "bg-[#4B9C93] text-white shadow-2xs"
+                      : "bg-slate-50 text-slate-600 hover:bg-slate-100"
+                  }`}
+                >
+                  {tab}
+                </button>
+              ))}
             </div>
           </div>
 
           {/* Applications List */}
           <div className="space-y-4">
-            {filteredApplications.length === 0 ? (
+            {loading ? (
+              <div className="bg-white rounded-2xl border border-slate-200 p-12 text-center space-y-3">
+                <div className="w-8 h-8 border-4 border-[#4B9C93]/20 border-t-[#4B9C93] rounded-full animate-spin mx-auto" />
+                <p className="text-xs text-slate-500">Loading your applications...</p>
+              </div>
+            ) : filteredApplications.length === 0 ? (
               <div className="bg-white rounded-2xl border border-slate-200 p-12 text-center space-y-3">
                 <div className="w-12 h-12 rounded-full bg-slate-100 flex items-center justify-center mx-auto text-slate-400">
                   <FileText className="w-6 h-6" />
@@ -221,7 +331,11 @@ export default function StudentApplicationsPage() {
                   No applications found
                 </h3>
                 <p className="text-xs text-slate-500 max-w-sm mx-auto">
-                  You do not have any applications matching "{activeTab}". Browse open internships to submit an application.
+                  {searchQuery.trim()
+                    ? `No applications matched "${searchQuery.trim()}".`
+                    : activeTab !== "All"
+                    ? `You do not have any applications matching "${activeTab}". Browse open internships to submit an application.`
+                    : "You haven't submitted any internship applications yet."}
                 </p>
                 <Link
                   href="/student/internships"
@@ -233,7 +347,8 @@ export default function StudentApplicationsPage() {
             ) : (
               filteredApplications.map((app) => {
                 const StatusIcon = statusStyles[app.status]?.icon || Clock;
-                const statusBadgeStyle = statusStyles[app.status]?.bg || "bg-slate-100 text-slate-700";
+                const statusBadgeStyle =
+                  statusStyles[app.status]?.bg || "bg-slate-100 text-slate-700";
 
                 return (
                   <div
@@ -242,10 +357,11 @@ export default function StudentApplicationsPage() {
                   >
                     <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4">
                       <div className="flex items-start gap-4">
-                        <img
+                        <CompanyLogo
                           src={app.logo}
-                          alt={app.companyName}
+                          companyName={app.companyName}
                           className="w-12 h-12 rounded-xl object-cover border border-slate-200 shrink-0"
+                          fallbackClassName="w-12 h-12 rounded-xl border border-slate-200 shrink-0 bg-teal-50 text-[#2b8a78] flex items-center justify-center font-bold text-sm tracking-wider select-none"
                         />
                         <div className="space-y-1">
                           <h3 className="font-bold text-sm sm:text-base text-slate-900">
@@ -265,6 +381,20 @@ export default function StudentApplicationsPage() {
                             </span>
                             <span>•</span>
                             <span>Applied on {app.appliedDate}</span>
+                            {app.interviewDate && (
+                              <>
+                                <span>•</span>
+                                <span className="flex items-center gap-1 font-semibold text-purple-700">
+                                  <Calendar className="w-3.5 h-3.5" />
+                                  Interview:{" "}
+                                  {new Date(app.interviewDate).toLocaleDateString("en-US", {
+                                    month: "short",
+                                    day: "numeric",
+                                    year: "numeric",
+                                  })}
+                                </span>
+                              </>
+                            )}
                           </div>
                         </div>
                       </div>
@@ -285,7 +415,9 @@ export default function StudentApplicationsPage() {
                       <div className="p-3 rounded-xl bg-slate-50 border border-slate-100 text-xs text-slate-700 flex items-start gap-2.5">
                         <AlertCircle className="w-4 h-4 text-[#4B9C93] shrink-0 mt-0.5" />
                         <div>
-                          <span className="font-semibold text-slate-900">Stage Update: </span>
+                          <span className="font-semibold text-slate-900">
+                            Stage Update:{" "}
+                          </span>
                           <span>{app.stageNotes}</span>
                         </div>
                       </div>
@@ -297,14 +429,20 @@ export default function StudentApplicationsPage() {
                         <span className="text-[11px] font-semibold text-slate-400 mr-1">
                           Skills Matched:
                         </span>
-                        {app.skillsMatched.map((skill) => (
-                          <span
-                            key={skill}
-                            className="px-2 py-0.5 rounded-md bg-teal-50 text-[#2b8a78] text-[10px] font-medium"
-                          >
-                            ✓ {skill}
+                        {(app.skillsMatched || []).length > 0 ? (
+                          app.skillsMatched.map((skill) => (
+                            <span
+                              key={skill}
+                              className="px-2 py-0.5 rounded-md bg-teal-50 text-[#2b8a78] text-[10px] font-medium"
+                            >
+                              ✓ {skill}
+                            </span>
+                          ))
+                        ) : (
+                          <span className="text-[10px] text-slate-400 italic">
+                            General profile match
                           </span>
-                        ))}
+                        )}
                       </div>
 
                       <div className="flex items-center gap-2 self-end sm:self-auto">
@@ -315,13 +453,22 @@ export default function StudentApplicationsPage() {
                           <MessageSquare className="w-3.5 h-3.5 text-slate-500" />
                           Chat Recruiter
                         </Link>
-                        <Link
-                          href={`/internships/${app.internshipId}`}
-                          className="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-black text-white text-xs font-semibold inline-flex items-center gap-1.5 transition-colors"
-                        >
-                          View Posting
-                          <ExternalLink className="w-3 h-3" />
-                        </Link>
+                        {app.internshipId ? (
+                          <Link
+                            href={`/internships/${app.internshipId}`}
+                            className="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-black text-white text-xs font-semibold inline-flex items-center gap-1.5 transition-colors"
+                          >
+                            View Posting
+                            <ExternalLink className="w-3 h-3" />
+                          </Link>
+                        ) : (
+                          <span
+                            className="px-3 py-1.5 rounded-xl bg-slate-100 text-slate-400 text-xs font-semibold cursor-not-allowed"
+                            title="Internship details are unavailable"
+                          >
+                            Posting unavailable
+                          </span>
+                        )}
                       </div>
                     </div>
                   </div>
