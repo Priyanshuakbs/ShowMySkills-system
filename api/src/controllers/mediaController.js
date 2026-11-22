@@ -63,6 +63,7 @@ export const mediaController = {
 
   /**
    * Delete file from XyphX Centralized Storage
+   * Also clears the matching fileId reference in the User document.
    * Endpoint: DELETE /api/media/:fileId
    */
   handleMediaDelete: async (req, res, next) => {
@@ -85,6 +86,53 @@ export const mediaController = {
       }
 
       const deleteResult = await storageService.deleteFile(fileId, userId);
+
+      // --- DB Reference Cleanup ---
+      // Clear any matching fileId stored on the authenticated user's document
+      if (req.user?.id) {
+        try {
+          const user = await User.findById(req.user.id).select(
+            'profileIconFileId resumeFileId companyProfile.logoFileId certifications achievements projects'
+          ).lean();
+
+          if (user) {
+            const $unset = {};
+            const $pull = {};
+
+            if (user.profileIconFileId === fileId) {
+              $unset.profileIconFileId = '';
+              $unset.profileIcon = '';
+            }
+            if (user.resumeFileId === fileId) {
+              $unset.resumeFileId = '';
+              $unset.resumeUrl = '';
+            }
+            if (user.companyProfile?.logoFileId === fileId) {
+              $unset['companyProfile.logoFileId'] = '';
+              $unset['companyProfile.logo'] = '';
+              $unset.profileIcon = '';
+            }
+
+            const ops = {};
+            if (Object.keys($unset).length) ops.$unset = $unset;
+
+            if (Object.keys(ops).length) {
+              await User.findByIdAndUpdate(req.user.id, ops);
+            }
+
+            // Pull matching fileId from arrays (certifications, achievements, projects)
+            await User.findByIdAndUpdate(req.user.id, {
+              $pull: {
+                certifications: { certificateFileId: fileId },
+                achievements: { proofFileId: fileId },
+                projects: { fileId },
+              },
+            });
+          }
+        } catch (cleanupErr) {
+          console.warn('[MediaController] DB cleanup after delete failed:', cleanupErr.message);
+        }
+      }
 
       return res.status(200).json({
         success: true,

@@ -256,6 +256,7 @@ const userSchema = new mongoose.Schema(
     companyProfile: {
       companyName: { type: String, default: '' },
       logo: { type: String, default: '' },
+      logoFileId: { type: String, default: null },
       tagline: { type: String, default: '' },
       aboutCompany: { type: String, default: '' },
       establishedYear: { type: Number },

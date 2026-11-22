@@ -2,6 +2,20 @@ import fs from 'node:fs';
 import { formatFileUrl } from '../services/uploadService.js';
 import storageService from '../services/storageService.js';
 import User from '../models/User.js';
+import Internship from '../models/Internship.js';
+
+/**
+ * Silently delete an old file from centralized storage.
+ * Never throws — just warns on failure.
+ */
+async function deleteOldFileFromStorage(fileId, userId) {
+  if (!fileId || !storageService.isConfigured()) return;
+  try {
+    await storageService.deleteFile(fileId, userId);
+  } catch (err) {
+    console.warn(`[StorageService] Failed to delete old file ${fileId}:`, err.message);
+  }
+}
 
 /**
  * Helper to upload a locally-saved multer file to XyphX Centralized Storage
@@ -41,6 +55,12 @@ export const uploadController = {
         return res.status(400).json({ success: false, message: 'No avatar image uploaded' });
       }
 
+      // Delete old avatar from centralized storage before replacing
+      if (req.user?.id) {
+        const existing = await User.findById(req.user.id).select('profileIconFileId').lean();
+        await deleteOldFileFromStorage(existing?.profileIconFileId, req.user.id);
+      }
+
       const { fileUrl, fileId } = await processUploadToCentralizedStorage(req, 'avatars');
 
       // If user is logged in, auto-update profileIcon
@@ -71,6 +91,12 @@ export const uploadController = {
     try {
       if (!req.file) {
         return res.status(400).json({ success: false, message: 'No resume document uploaded' });
+      }
+
+      // Delete old resume from centralized storage before replacing
+      if (req.user?.id) {
+        const existing = await User.findById(req.user.id).select('resumeFileId').lean();
+        await deleteOldFileFromStorage(existing?.resumeFileId, req.user.id);
       }
 
       const { fileUrl, fileId } = await processUploadToCentralizedStorage(req, 'resumes');
@@ -126,12 +152,25 @@ export const uploadController = {
         return res.status(400).json({ success: false, message: 'No logo image uploaded' });
       }
 
+      // Delete old logo from centralized storage before replacing
+      if (req.user?.id) {
+        const existing = await User.findById(req.user.id).select('companyProfile.logoFileId profileIconFileId').lean();
+        const oldFileId = existing?.companyProfile?.logoFileId || existing?.profileIconFileId;
+        await deleteOldFileFromStorage(oldFileId, req.user.id);
+      }
+
       const { fileUrl, fileId } = await processUploadToCentralizedStorage(req, 'company-logos');
 
       if (req.user?.id) {
-        await User.findByIdAndUpdate(req.user.id, {
-          $set: { 'companyProfile.logo': fileUrl, profileIcon: fileUrl },
-        });
+        const updateFields = {
+          'companyProfile.logo': fileUrl,
+          profileIcon: fileUrl,
+        };
+        if (fileId) {
+          updateFields['companyProfile.logoFileId'] = fileId;
+          updateFields.profileIconFileId = fileId;
+        }
+        await User.findByIdAndUpdate(req.user.id, { $set: updateFields });
       }
 
       res.status(201).json({
@@ -180,13 +219,14 @@ export const uploadController = {
         return res.status(400).json({ success: false, message: 'No poster image uploaded' });
       }
 
-      const fileUrl = formatFileUrl(req, req.file, 'internship-posters');
+      const { fileUrl, fileId } = await processUploadToCentralizedStorage(req, 'internship-posters');
 
       res.status(201).json({
         success: true,
         message: 'Internship poster uploaded successfully',
         data: {
           url: fileUrl,
+          fileId,
           filename: req.file.filename,
           size: req.file.size,
           mimetype: req.file.mimetype,
