@@ -3,7 +3,7 @@ import multer from 'multer';
 import { authController } from '../controllers/authController.js';
 import { authMiddleware } from '../middleware/authMiddleware.js';
 import { authRateLimiter, otpRateLimiter } from '../middleware/security.js';
-import { validateLogin, validateRegister } from '../validators/authValidator.js';
+import { validateLogin, validateProfileUpdate, validateRegister } from '../validators/authValidator.js';
 
 const upload = multer({
   dest: 'uploads/college-ids/',
@@ -463,7 +463,7 @@ router.get('/me', authMiddleware, authController.getMe);
  *       401:
  *         description: Unauthorized
  */
-router.put('/me', authMiddleware, authController.updateMe);
+router.put('/me', authMiddleware, validateProfileUpdate, authController.updateMe);
 
 /**
  * @openapi

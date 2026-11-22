@@ -1,5 +1,6 @@
 import assert from 'node:assert';
 import { test } from 'node:test';
+import { calculateProfileCompletion } from '../api/src/services/userService.js';
 
 test('Backend Architecture: Student Role Tags match UI specifications', () => {
   const allowedStudentTags = ['Admin', 'Maintainer', 'Promoter', 'Contributor', 'Ambassador', 'Regular'];
@@ -32,33 +33,27 @@ test('Backend Architecture: Application ATS Candidate Status Transitions', () =>
 });
 
 test('Backend Architecture: Profile Completion Percentage Calculator', () => {
-  const calculateCompletion = (profile) => {
-    let score = 0;
-    if (profile.name) score += 20;
-    if (profile.headline) score += 15;
-    if (profile.bio) score += 15;
-    if (profile.skills && profile.skills.length > 0) score += 20;
-    if (profile.projects && profile.projects.length > 0) score += 20;
-    if (profile.resumeUrl) score += 10;
-    return Math.min(100, Math.max(30, score));
-  };
-
   const fullProfile = {
+    role: 'student',
     name: 'Candidate User',
     headline: 'Frontend Engineer',
     bio: 'Passionate builder',
-    skills: ['React', 'Next.js'],
+    location: 'Bengaluru',
+    profileIcon: '/uploads/avatars/candidate.png',
+    college: 'Example University',
+    course: 'B.Tech',
+    branch: 'Computer Science',
+    graduationYear: 2027,
+    skills: [{ name: 'React' }, { name: 'Next.js' }],
     projects: [{ title: 'CampusHub' }],
     resumeUrl: 'https://example.com/resume.pdf',
+    githubUrl: 'https://github.com/candidate',
+    certifications: [{ name: 'Cloud Fundamentals' }],
   };
 
-  assert.strictEqual(calculateCompletion(fullProfile), 100);
-
-  const partialProfile = {
-    name: 'New Student',
-  };
-
-  assert.strictEqual(calculateCompletion(partialProfile), 30); // minimum baseline
+  assert.strictEqual(calculateProfileCompletion(fullProfile), 100);
+  assert.strictEqual(calculateProfileCompletion({ name: 'New Student' }), 10);
+  assert.strictEqual(calculateProfileCompletion({}), 0);
 });
 
 test('Backend Architecture: Internship Filter Query Builder', () => {

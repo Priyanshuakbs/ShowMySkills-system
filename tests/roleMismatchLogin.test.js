@@ -1,11 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import mongoose from 'mongoose';
-import bcrypt from 'bcryptjs';
+import { createRequire } from 'node:module';
 import User from '../api/src/models/User.js';
 import { userService } from '../api/src/services/userService.js';
 import { authController } from '../api/src/controllers/authController.js';
 import app from '../api/src/app.js';
+
+const requireApi = createRequire(new URL('../api/package.json', import.meta.url));
+const mongoose = requireApi('mongoose');
+const bcrypt = requireApi('bcryptjs');
 
 // Setup mock user database
 const testPassword = 'Password123!';

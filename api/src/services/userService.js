@@ -6,12 +6,302 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { User } from '../models/User.js';
 import { OtpVerification } from '../models/OtpVerification.js';
+import { sanitizeProfileUpdate } from '../utils/profileUpdateSanitizer.js';
 
 const OTP_EXPIRY_MS = 10 * 60 * 1000; // 10 minutes
 const RATE_LIMIT_COOLDOWN_MS = 60 * 1000; // 60 seconds between resends
 const MAX_OTP_ATTEMPTS = 5;
 const MAX_RESENDS_WINDOW = 5;
 const RESEND_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+
+// Use positive projections for profile reads so newly added account/security
+// fields are never exposed by these APIs by default.
+const AUTHENTICATED_PROFILE_FIELDS = [
+  'name email phone role roleTag displayOrder headline bio dob location profileIcon',
+  'college course branch graduationYear experienceLevel',
+  'skills primarySkills projects certifications achievements metrics reputationScore topPercentile',
+  'completionPercentage resumeUrl portfolioUrl githubUrl linkedinUrl openToWorkMessage',
+  'companyProfile collegeProfile notificationPreferences privacyPreferences createdAt updatedAt',
+].join(' ');
+
+const PUBLIC_PROFILE_FIELDS = [
+  '_id name role roleTag headline bio location profileIcon',
+  'college course branch graduationYear experienceLevel skills primarySkills projects certifications',
+  'achievements metrics reputationScore topPercentile completionPercentage portfolioUrl',
+  'githubUrl linkedinUrl openToWorkMessage createdAt updatedAt',
+  'companyProfile.companyName companyProfile.logo companyProfile.tagline companyProfile.aboutCompany',
+  'companyProfile.establishedYear companyProfile.industryType companyProfile.companySize',
+  'companyProfile.website companyProfile.linkedin companyProfile.awards companyProfile.certifications',
+  'collegeProfile.collegeName collegeProfile.aboutCollege collegeProfile.establishedYear',
+  'collegeProfile.collegeType collegeProfile.pincode collegeProfile.departments collegeProfile.courses',
+  'collegeProfile.numberOfStudents collegeProfile.numberOfDepartments collegeProfile.placementRate',
+  'collegeProfile.studentsPlaced collegeProfile.companiesVisited collegeProfile.highestPackage',
+  'collegeProfile.averagePackage collegeProfile.internshipParticipation collegeProfile.website collegeProfile.linkedin',
+].join(' ');
+
+export const DIRECTORY_PROFILE_FIELDS = [
+  '_id name role roleTag headline bio location profileIcon',
+  'college course branch graduationYear experienceLevel skills primarySkills projects certifications',
+  'achievements metrics reputationScore topPercentile completionPercentage portfolioUrl githubUrl linkedinUrl',
+  'openToWorkMessage createdAt updatedAt',
+  'companyProfile.companyName companyProfile.tagline companyProfile.industryType companyProfile.companySize',
+  'companyProfile.website companyProfile.logo collegeProfile.collegeName collegeProfile.collegeType',
+  'collegeProfile.website collegeProfile.logo',
+].join(' ');
+
+const DIRECTORY_PROFILE_FIELD_NAMES = new Set(DIRECTORY_PROFILE_FIELDS.split(/\s+/));
+const DIRECTORY_SKILL_FIELDS = new Set(['name', 'level', 'endorsedCount']);
+const DIRECTORY_PROJECT_FIELDS = new Set(['id', 'title', 'description', 'tags', 'verified', 'repoUrl', 'liveUrl']);
+const DIRECTORY_METRIC_FIELDS = new Set(['label', 'value', 'color']);
+const DIRECTORY_CERTIFICATION_FIELDS = new Set(['name', 'issuingOrganization', 'validationDate', 'isVerified']);
+const DIRECTORY_ACHIEVEMENT_FIELDS = new Set(['achievement', 'year']);
+const sanitizeDirectoryItems = (items, allowedFields) => {
+  if (!Array.isArray(items)) return [];
+  return items
+    .filter((item) => item && typeof item === 'object' && !Array.isArray(item))
+    .map((item) => Object.fromEntries(
+      Object.entries(item).filter(([field]) => allowedFields.has(field))
+    ));
+};
+
+export const sanitizeDirectoryUser = (user) => {
+  const source = typeof user?.toObject === 'function' ? user.toObject() : user;
+  if (!source || typeof source !== 'object') return source;
+
+  const sanitized = Object.fromEntries(
+    Object.entries(source).filter(([field]) => DIRECTORY_PROFILE_FIELD_NAMES.has(field))
+  );
+  for (const group of ['companyProfile', 'collegeProfile']) {
+    if (!source[group] || typeof source[group] !== 'object') continue;
+    const nestedFields = [...DIRECTORY_PROFILE_FIELD_NAMES]
+      .filter((field) => field.startsWith(`${group}.`))
+      .map((field) => field.slice(group.length + 1));
+    sanitized[group] = Object.fromEntries(
+      Object.entries(source[group]).filter(([field]) => nestedFields.includes(field))
+    );
+  }
+  if ('skills' in source) {
+    sanitized.skills = sanitizeDirectoryItems(source.skills, DIRECTORY_SKILL_FIELDS);
+  }
+  if ('projects' in source) {
+    sanitized.projects = sanitizeDirectoryItems(source.projects, DIRECTORY_PROJECT_FIELDS);
+  }
+  if ('metrics' in source) {
+    sanitized.metrics = sanitizeDirectoryItems(source.metrics, DIRECTORY_METRIC_FIELDS);
+  }
+  if ('certifications' in source) {
+    sanitized.certifications = sanitizeDirectoryItems(source.certifications, DIRECTORY_CERTIFICATION_FIELDS);
+  }
+  if ('achievements' in source) {
+    sanitized.achievements = sanitizeDirectoryItems(source.achievements, DIRECTORY_ACHIEVEMENT_FIELDS);
+  }
+  return sanitized;
+};
+
+const PUBLIC_PROFILE_FIELD_NAMES = new Set(PUBLIC_PROFILE_FIELDS.split(/\s+/));
+const PUBLIC_COMPANY_PROFILE_FIELDS = new Set([
+  'companyName', 'logo', 'tagline', 'aboutCompany', 'establishedYear',
+  'industryType', 'companySize', 'website', 'linkedin', 'awards', 'certifications',
+]);
+const PUBLIC_COMPANY_AWARD_FIELDS = new Set(['name', 'receivedYear', 'category']);
+const PUBLIC_COMPANY_CERTIFICATION_FIELDS = new Set(['name', 'issuingBody', 'validationDate']);
+const PUBLIC_COLLEGE_PROFILE_FIELDS = new Set([
+  'collegeName', 'aboutCollege', 'establishedYear', 'collegeType', 'departments', 'courses',
+  'numberOfStudents', 'numberOfDepartments', 'placementRate', 'studentsPlaced',
+  'companiesVisited', 'highestPackage', 'averagePackage', 'internshipParticipation',
+  'website', 'linkedin',
+]);
+
+const sanitizeStringArray = (value) =>
+  Array.isArray(value) ? value.filter((item) => typeof item === 'string') : [];
+
+const sanitizePublicProfile = (profile) => {
+  const source = typeof profile?.toObject === 'function' ? profile.toObject() : profile;
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return source;
+
+  const sanitized = Object.fromEntries(
+    Object.entries(source).filter(([field]) => PUBLIC_PROFILE_FIELD_NAMES.has(field))
+  );
+  for (const [field, allowedFields] of [
+    ['skills', DIRECTORY_SKILL_FIELDS],
+    ['projects', DIRECTORY_PROJECT_FIELDS],
+    ['metrics', DIRECTORY_METRIC_FIELDS],
+    ['certifications', DIRECTORY_CERTIFICATION_FIELDS],
+    ['achievements', DIRECTORY_ACHIEVEMENT_FIELDS],
+  ]) {
+    if (field in source) sanitized[field] = sanitizeDirectoryItems(source[field], allowedFields);
+  }
+  if ('primarySkills' in source) sanitized.primarySkills = sanitizeStringArray(source.primarySkills);
+
+  if (source.companyProfile && typeof source.companyProfile === 'object' && !Array.isArray(source.companyProfile)) {
+    const company = Object.fromEntries(
+      Object.entries(source.companyProfile).filter(([field]) => PUBLIC_COMPANY_PROFILE_FIELDS.has(field))
+    );
+    if ('awards' in company) company.awards = sanitizeDirectoryItems(company.awards, PUBLIC_COMPANY_AWARD_FIELDS);
+    if ('certifications' in company) {
+      company.certifications = sanitizeDirectoryItems(company.certifications, PUBLIC_COMPANY_CERTIFICATION_FIELDS);
+    }
+    sanitized.companyProfile = company;
+  }
+  if (source.collegeProfile && typeof source.collegeProfile === 'object' && !Array.isArray(source.collegeProfile)) {
+    sanitized.collegeProfile = Object.fromEntries(
+      Object.entries(source.collegeProfile)
+        .filter(([field]) => PUBLIC_COLLEGE_PROFILE_FIELDS.has(field))
+        .map(([field, value]) => [
+          field,
+          ['departments', 'courses'].includes(field) ? sanitizeStringArray(value) : value,
+        ])
+    );
+  }
+  return sanitized;
+};
+
+const hasText = (value) => typeof value === 'string' && value.trim().length > 0;
+const hasItems = (value, predicate = (item) => Boolean(item)) =>
+  Array.isArray(value) && value.some(predicate);
+const hasNamedItem = (value, field) => hasItems(value, (item) => hasText(item?.[field]));
+
+const weightedCompletion = (criteria) => {
+  const total = criteria.reduce((score, [weight, complete]) => score + (complete ? weight : 0), 0);
+  return Math.max(0, Math.min(100, Math.round(total)));
+};
+
+/** Calculate a whole-profile completion score using the user's applicable profile fields. */
+export const calculateProfileCompletion = (profile = {}) => {
+  const role = String(profile.role || 'student').toLowerCase();
+
+  // Company and college accounts use the fields relevant to their profile types.
+  if (role === 'company') {
+    const company = profile.companyProfile || {};
+    return weightedCompletion([
+      [10, hasText(profile.name)],
+      [10, hasText(company.companyName)],
+      [10, hasText(company.tagline)],
+      [20, hasText(company.aboutCompany)],
+      [5, hasText(profile.location)],
+      [5, hasText(company.logo)],
+      [5, Number(company.establishedYear) > 0],
+      [10, hasText(company.industryType)],
+      [10, hasText(company.companySize)],
+      [5, hasText(company.website)],
+      [5, hasText(company.linkedin)],
+      [5, hasNamedItem(company.awards, 'name') || hasNamedItem(company.certifications, 'name')],
+    ]);
+  }
+
+  if (role === 'college') {
+    const college = profile.collegeProfile || {};
+    return weightedCompletion([
+      [10, hasText(profile.name)],
+      [10, hasText(college.collegeName)],
+      [15, hasText(college.aboutCollege)],
+      [5, hasText(profile.profileIcon)],
+      [5, hasText(profile.location)],
+      [5, Number(college.establishedYear) > 0],
+      [10, hasText(college.collegeType)],
+      [5, hasText(college.pincode)],
+      [10, hasItems(college.departments, hasText)],
+      [10, hasItems(college.courses, hasText)],
+      [5, hasText(college.website)],
+      [5, hasText(college.linkedin)],
+      [5, Number(college.numberOfStudents) > 0],
+    ]);
+  }
+
+  const hasEducation = [profile.college, profile.course, profile.branch].map(hasText);
+  return weightedCompletion([
+    [10, hasText(profile.name)],
+    [10, hasText(profile.headline)],
+    [10, hasText(profile.bio)],
+    [5, hasText(profile.location)],
+    [5, hasText(profile.profileIcon)],
+    [5, hasEducation[0]],
+    [5, hasEducation[1]],
+    [5, hasEducation[2]],
+    [5, Number(profile.graduationYear) > 0],
+    [10, hasNamedItem(profile.skills, 'name') || hasItems(profile.primarySkills, hasText)],
+    [10, hasNamedItem(profile.projects, 'title')],
+    [10, hasText(profile.resumeUrl)],
+    [5, hasText(profile.portfolioUrl) || hasText(profile.githubUrl) || hasText(profile.linkedinUrl)],
+    [5, hasNamedItem(profile.certifications, 'name') || hasNamedItem(profile.achievements, 'achievement')],
+  ]);
+};
+
+const mergeProfileUpdate = (currentProfile, updateData) => {
+  const merged = { ...currentProfile };
+  for (const [path, value] of Object.entries(updateData)) {
+    const segments = path.split('.');
+    let target = merged;
+    for (const segment of segments.slice(0, -1)) {
+      target[segment] = { ...(target[segment] || {}) };
+      target = target[segment];
+    }
+    target[segments.at(-1)] = value;
+  }
+  return merged;
+};
+
+const preserveTrustedMetadataForUnchangedItems = (updateData, currentProfile) => {
+  const preserve = (submittedItems, existingItems, identityFields, trustedFields) => {
+    if (!Array.isArray(submittedItems) || !Array.isArray(existingItems)) return submittedItems;
+    const normalizeIdentity = (field, value) => {
+      if (value == null) return null;
+      if (field === 'validationDate') {
+        const date = new Date(value);
+        if (!Number.isNaN(date.getTime())) return date.toISOString();
+      }
+      if (['year', 'receivedYear'].includes(field) && value !== '') return Number(value);
+      return JSON.stringify(value);
+    };
+    return submittedItems.map((submitted) => {
+      const existing = existingItems.find((candidate) => identityFields.every((field) =>
+        normalizeIdentity(field, candidate?.[field]) === normalizeIdentity(field, submitted?.[field])
+      ));
+      if (!existing) return submitted;
+      const result = { ...submitted };
+      for (const field of trustedFields) {
+        if (existing[field] !== undefined) result[field] = existing[field];
+      }
+      return result;
+    });
+  };
+
+  for (const [field, identityFields, trustedFields] of [
+    ['skills', ['name', 'level'], ['endorsedCount']],
+    ['projects', ['id', 'title', 'description', 'tags', 'repoUrl', 'liveUrl'], ['verified']],
+    ['certifications', ['name', 'issuingOrganization', 'validationDate'], ['isVerified', 'certificateFile']],
+    ['achievements', ['achievement', 'year'], ['proofFile']],
+  ]) {
+    if (updateData[field] !== undefined) {
+      updateData[field] = preserve(updateData[field], currentProfile[field], identityFields, trustedFields);
+    }
+  }
+
+  for (const [field, identityFields] of [
+    ['awards', ['name', 'receivedYear', 'category']],
+    ['certifications', ['name', 'issuingBody', 'validationDate']],
+  ]) {
+    const updatePath = `companyProfile.${field}`;
+    if (updateData[updatePath] !== undefined) {
+      updateData[updatePath] = preserve(
+        updateData[updatePath],
+        currentProfile.companyProfile?.[field],
+        identityFields,
+        ['certificateFile']
+      );
+    }
+  }
+};
+
+const synchronizeCompletion = async (user, persist = false) => {
+  const profile = typeof user.toObject === 'function' ? user.toObject() : user;
+  const completionPercentage = calculateProfileCompletion(profile);
+  if (Number(user.completionPercentage) !== completionPercentage) {
+    user.completionPercentage = completionPercentage;
+    if (persist && typeof user.save === 'function') await user.save();
+  }
+  return user;
+};
 
 const hashOtp = (otp) => {
   return crypto.createHash('sha256').update(String(otp).trim()).digest('hex');
@@ -301,6 +591,8 @@ export const userService = {
       };
     }
 
+    userPayload.completionPercentage = calculateProfileCompletion(userPayload);
+
     const user = await User.create(userPayload);
 
     if (!isEmailPreVerified) {
@@ -589,17 +881,31 @@ export const userService = {
     return { success: true, message: 'Password updated successfully. You can now log in.' };
   },
 
-  getUserById: async (userId) => {
-    const user = await User.findById(userId).select('-password -emailVerificationOtp -passwordResetOtp');
+  getCurrentUserById: async (userId) => {
+    const user = await User.findById(userId).select(AUTHENTICATED_PROFILE_FIELDS);
     if (!user) {
       const error = new Error('User not found');
       error.statusCode = 404;
       throw error;
     }
-    return user;
+    return synchronizeCompletion(user, true);
+  },
+
+  getUserById: async (userId) => {
+    // Resume URL is loaded only to calculate the complete score; omit it from
+    // the returned public profile object.
+    const user = await User.findById(userId).select(`${PUBLIC_PROFILE_FIELDS} resumeUrl`);
+    if (!user) {
+      const error = new Error('User not found');
+      error.statusCode = 404;
+      throw error;
+    }
+    await synchronizeCompletion(user);
+    return sanitizePublicProfile(user);
   },
 
   updateProfile: async (userId, data) => {
+    const safeData = sanitizeProfileUpdate(data);
     const allowedFields = [
       'name',
       'headline',
@@ -618,12 +924,12 @@ export const userService = {
       'projects',
       'certifications',
       'achievements',
-      'resumeUrl',
       'portfolioUrl',
       'githubUrl',
       'linkedinUrl',
       'companyProfile',
       'collegeProfile',
+      'openToWorkMessage',
       'notificationPreferences',
       'privacyPreferences',
       'twoFactorEnabled',
@@ -631,45 +937,54 @@ export const userService = {
 
     const updateData = {};
     for (const key of allowedFields) {
-      if (data[key] !== undefined) {
-        updateData[key] = data[key];
+      if (safeData[key] !== undefined) {
+        updateData[key] = safeData[key];
       }
     }
 
-    // Map common aliases from frontend forms
-    if (data.companyProfile && typeof data.companyProfile === 'object') {
-      delete updateData.companyProfile;
-      for (const [subKey, subVal] of Object.entries(data.companyProfile)) {
-        updateData[`companyProfile.${subKey}`] = subVal;
+    // Flatten nested groups into dotted updates so omitted sibling values remain intact.
+    for (const field of [
+      'companyProfile',
+      'collegeProfile',
+      'notificationPreferences',
+      'privacyPreferences',
+    ]) {
+      if (safeData[field] && typeof safeData[field] === 'object' && !Array.isArray(safeData[field])) {
+        delete updateData[field];
+        for (const [subKey, subVal] of Object.entries(safeData[field])) {
+          updateData[`${field}.${subKey}`] = subVal;
+        }
       }
     }
 
-    if (data.logo !== undefined) {
-      updateData['companyProfile.logo'] = data.logo;
-      updateData.profileIcon = data.logo;
-    } else if (data.companyProfile?.logo !== undefined) {
-      updateData.profileIcon = data.companyProfile.logo;
+    if (safeData.logo !== undefined) {
+      updateData['companyProfile.logo'] = safeData.logo;
+      updateData.profileIcon = safeData.logo;
+    } else if (safeData.companyProfile?.logo !== undefined) {
+      updateData.profileIcon = safeData.companyProfile.logo;
     }
 
-    const yearVal = data.establishedYear !== undefined ? data.establishedYear : data.establishmentYear;
+    const yearVal = safeData.establishedYear !== undefined ? safeData.establishedYear : safeData.establishmentYear;
     if (yearVal !== undefined) {
       updateData['companyProfile.establishedYear'] = yearVal ? Number(yearVal) : null;
     }
-    const sizeVal = data.companySize !== undefined ? data.companySize : data.teamSize;
+    const sizeVal = safeData.companySize !== undefined ? safeData.companySize : safeData.teamSize;
     if (sizeVal !== undefined) {
       updateData['companyProfile.companySize'] = sizeVal ? String(sizeVal).trim() : '';
     }
 
-    if (data.github && !updateData.githubUrl) updateData.githubUrl = data.github;
-    if (data.linkedin && !updateData.linkedinUrl) updateData.linkedinUrl = data.linkedin;
-    if (data.department && !updateData.branch) updateData.branch = data.department;
-    if (data.about && !updateData.bio) updateData.bio = data.about;
-    if (data.collegeName && !updateData.college) updateData.college = data.collegeName;
-    if (data.gradYear && !updateData.graduationYear) updateData.graduationYear = Number(data.gradYear);
+    if (safeData.github !== undefined && updateData.githubUrl === undefined) updateData.githubUrl = safeData.github;
+    if (safeData.linkedin !== undefined && updateData.linkedinUrl === undefined) updateData.linkedinUrl = safeData.linkedin;
+    if (safeData.department !== undefined && updateData.branch === undefined) updateData.branch = safeData.department;
+    if (safeData.about !== undefined && updateData.bio === undefined) updateData.bio = safeData.about;
+    if (safeData.collegeName !== undefined && updateData.college === undefined) updateData.college = safeData.collegeName;
+    if (safeData.gradYear !== undefined && safeData.gradYear !== '' && updateData.graduationYear === undefined) {
+      updateData.graduationYear = Number(safeData.gradYear);
+    }
 
     // If password change is requested in profile/settings
-    const currentPass = data.currentPassword || data.passwords?.current;
-    const newPass = data.newPassword || data.passwords?.newPass;
+    const currentPass = safeData.currentPassword || safeData.passwords?.current;
+    const newPass = safeData.newPassword || safeData.passwords?.newPass;
     if (currentPass && newPass) {
       const user = await User.findById(userId);
       const matches = await bcrypt.compare(currentPass, user.password);
@@ -687,21 +1002,42 @@ export const userService = {
       await user.save();
     }
 
-    // Auto calculate completion percentage
-    let completedPoints = 0;
-    if (updateData.name || data.name) completedPoints += 20;
-    if (updateData.headline || data.headline) completedPoints += 15;
-    if (updateData.bio || data.bio) completedPoints += 15;
-    if ((updateData.skills && updateData.skills.length) || (data.skills && data.skills.length)) completedPoints += 20;
-    if ((updateData.projects && updateData.projects.length) || (data.projects && data.projects.length)) completedPoints += 20;
-    if (updateData.resumeUrl || data.resumeUrl) completedPoints += 10;
-    updateData.completionPercentage = Math.min(100, Math.max(30, completedPoints));
+    const currentProfile = await User.findById(userId).select(AUTHENTICATED_PROFILE_FIELDS);
+    if (!currentProfile) {
+      const error = new Error('User not found');
+      error.statusCode = 404;
+      throw error;
+    }
 
-    const updatedUser = await User.findByIdAndUpdate(userId, { $set: updateData }, { new: true }).select(
-      '-password -emailVerificationOtp -passwordResetOtp -refreshTokens'
+    const currentProfileData = typeof currentProfile.toObject === 'function'
+      ? currentProfile.toObject()
+      : currentProfile;
+    preserveTrustedMetadataForUnchangedItems(updateData, currentProfileData);
+    const resultingProfile = mergeProfileUpdate(currentProfileData, updateData);
+    updateData.completionPercentage = calculateProfileCompletion(resultingProfile);
+
+    const updatedUser = await User.findByIdAndUpdate(
+      userId,
+      { $set: updateData },
+      { new: true, runValidators: true }
+    ).select(
+      AUTHENTICATED_PROFILE_FIELDS
     );
 
     return updatedUser;
+  },
+
+  updateResume: async (userId, resumeUrl) => {
+    const user = await User.findById(userId).select(AUTHENTICATED_PROFILE_FIELDS);
+    if (!user) return null;
+
+    const currentProfile = typeof user.toObject === 'function' ? user.toObject() : user;
+    const completionPercentage = calculateProfileCompletion({ ...currentProfile, resumeUrl });
+    return User.findByIdAndUpdate(
+      userId,
+      { $set: { resumeUrl, completionPercentage } },
+      { new: true, runValidators: true }
+    ).select(AUTHENTICATED_PROFILE_FIELDS);
   },
 
   updateSettings: async (userId, data) => {
@@ -729,7 +1065,7 @@ export const userService = {
     }
 
     const updatedUser = await User.findByIdAndUpdate(userId, { $set: updateData }, { new: true }).select(
-      '-password -emailVerificationOtp -passwordResetOtp'
+      AUTHENTICATED_PROFILE_FIELDS
     );
 
     return updatedUser;
@@ -765,7 +1101,7 @@ export const userService = {
 
     const [users, total] = await Promise.all([
       User.find(filter)
-        .select('-password -emailVerificationOtp -passwordResetOtp')
+        .select(DIRECTORY_PROFILE_FIELDS)
         .sort({ displayOrder: 1, createdAt: 1 })
         .skip(skip)
         .limit(Number(limit)),
@@ -773,7 +1109,7 @@ export const userService = {
     ]);
 
     return {
-      users,
+      users: users.map(sanitizeDirectoryUser),
       pagination: {
         page: Number(page),
         limit: Number(limit),
@@ -782,4 +1118,5 @@ export const userService = {
       },
     };
   },
+
 };

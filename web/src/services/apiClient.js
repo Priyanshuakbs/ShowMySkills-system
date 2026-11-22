@@ -138,9 +138,13 @@ async function refreshTokensDirectly() {
  * Standard API request with timeout, auto-injected Bearer auth,
  * and automated silent token refresh on 401 expiration.
  */
-export async function apiRequest(endpoint, method = "GET", body = null, customHeaders = {}) {
+export async function apiRequest(endpoint, method = "GET", body = null, customHeaders = {}, responseType = "json") {
   const baseUrl = getApiBaseUrl();
-  const formattedEndpoint = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
+  const isAbsoluteUrl = /^https?:\/\//i.test(endpoint);
+  const formattedEndpoint = isAbsoluteUrl
+    ? endpoint
+    : endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
+  const requestUrl = isAbsoluteUrl ? formattedEndpoint : `${baseUrl}${formattedEndpoint}`;
 
   const headers = { ...customHeaders };
 
@@ -167,7 +171,7 @@ export async function apiRequest(endpoint, method = "GET", body = null, customHe
   options.signal = controller.signal;
 
   try {
-    let res = await fetch(`${baseUrl}${formattedEndpoint}`, options);
+    let res = await fetch(requestUrl, options);
 
     // Auto-refresh token if access token expired (HTTP 401 on authenticated endpoints)
     if (
@@ -181,7 +185,7 @@ export async function apiRequest(endpoint, method = "GET", body = null, customHe
         const latestAccessToken = tokenStorage.getAccessToken();
         if (latestAccessToken && latestAccessToken !== accessToken) {
           headers.Authorization = `Bearer ${latestAccessToken}`;
-          res = await fetch(`${baseUrl}${formattedEndpoint}`, { ...options, headers });
+          res = await fetch(requestUrl, { ...options, headers });
         } else {
           if (!refreshPromise) {
             refreshPromise = refreshTokensDirectly().finally(() => {
@@ -199,7 +203,7 @@ export async function apiRequest(endpoint, method = "GET", body = null, customHe
             ...options,
             headers: retryHeaders,
           };
-          res = await fetch(`${baseUrl}${formattedEndpoint}`, retryOptions);
+          res = await fetch(requestUrl, retryOptions);
         }
       } catch {
         // Refresh token failed or revoked; proceed to error handling below
@@ -223,7 +227,7 @@ export async function apiRequest(endpoint, method = "GET", body = null, customHe
       throw err;
     }
 
-    return await res.json();
+    return responseType === "blob" ? await res.blob() : await res.json();
   } catch (err) {
     clearTimeout(timeoutId);
     throw err;
@@ -481,7 +485,9 @@ export const skillService = {
 export const collegeService = {
   getStudents: async (params = {}) => {
     const queryString = new URLSearchParams(params).toString();
-    const endpoint = queryString ? `/users?role=student&${queryString}` : "/users?role=student";
+    const endpoint = queryString
+      ? `/users/college/students?${queryString}`
+      : "/users/college/students";
     return apiFetchWithFallback(endpoint, "GET", null, []);
   },
 
@@ -661,6 +667,42 @@ export const supportService = {
 };
 
 export const uploadService = {
+  uploadAvatar: async (file) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    return apiRequest("/upload/avatar", "POST", formData);
+  },
+
+  uploadResume: async (file) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    return apiRequest("/upload/resume", "POST", formData);
+  },
+
+  downloadResume: async (resumeUrl) => {
+    if (typeof resumeUrl !== "string" || !resumeUrl.trim()) {
+      throw new Error("No resume is available to download.");
+    }
+
+    const apiUrl = new URL(getApiBaseUrl());
+    let fileUrl;
+    try {
+      fileUrl = new URL(resumeUrl, `${apiUrl.origin}/`);
+    } catch {
+      throw new Error("The saved resume URL is invalid.");
+    }
+
+    if (
+      fileUrl.origin !== apiUrl.origin ||
+      !fileUrl.pathname.startsWith("/uploads/resumes/") ||
+      fileUrl.pathname.includes("..")
+    ) {
+      throw new Error("The saved resume URL is not available from this account.");
+    }
+
+    return apiRequest(fileUrl.href, "GET", null, {}, "blob");
+  },
+
   uploadInternshipPoster: async (file) => {
     const formData = new FormData();
     formData.append("file", file);

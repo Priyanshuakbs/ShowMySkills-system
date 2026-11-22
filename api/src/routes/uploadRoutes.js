@@ -11,6 +11,20 @@ import {
 } from '../services/uploadService.js';
 import { submissionRateLimiter } from '../middleware/security.js';
 
+const resumeUploadMiddleware = (req, res, next) => {
+  uploadResume.single('file')(req, res, (error) => {
+    if (!error) return next();
+
+    if (error.code?.startsWith('LIMIT_')) {
+      error.statusCode = error.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
+    } else if (error.message?.startsWith('Invalid document format.')) {
+      error.statusCode = 400;
+    }
+
+    next(error);
+  });
+};
+
 const router = Router();
 
 router.use(authMiddleware);
@@ -20,7 +34,7 @@ router.use(submissionRateLimiter);
  * @openapi
  * /api/upload/avatar:
  *   post:
- *     summary: Upload profile photo avatar (JPEG, PNG, WebP)
+ *     summary: Upload profile photo avatar (JPEG, PNG, WebP, SVG)
  *     description: Uploads a user avatar image and automatically updates the profileIcon field for the authenticated user.
  *     security:
  *       - bearerAuth: []
@@ -53,6 +67,7 @@ router.use(submissionRateLimiter);
  *                   type: object
  *                   properties:
  *                     url: { type: string, example: 'http://localhost:5000/uploads/avatars/avatar-123.jpg' }
+ *                     profileIcon: { type: string, example: 'http://localhost:5000/uploads/avatars/avatar-123.jpg' }
  *                     filename: { type: string, example: 'avatar-123.jpg' }
  *                     size: { type: integer, example: 450000 }
  *       400:
@@ -97,11 +112,12 @@ router.post('/avatar', uploadAvatar.single('file'), uploadController.handleAvata
  *                   type: object
  *                   properties:
  *                     url: { type: string, example: 'http://localhost:5000/uploads/resumes/resume-456.pdf' }
+ *                     resumeUrl: { type: string, example: 'http://localhost:5000/uploads/resumes/resume-456.pdf' }
  *                     filename: { type: string, example: 'resume-456.pdf' }
  *       400:
  *         description: No file attached or invalid file format
  */
-router.post('/resume', uploadResume.single('file'), uploadController.handleResumeUpload);
+router.post('/resume', resumeUploadMiddleware, uploadController.handleResumeUpload);
 
 /**
  * @openapi

@@ -215,7 +215,7 @@ const userSchema = new mongoose.Schema(
     },
     completionPercentage: {
       type: Number,
-      default: 80,
+      default: 0,
       min: 0,
       max: 100,
     },

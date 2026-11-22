@@ -20,7 +20,7 @@ import {
 
 import DashboardSidebar from "@/components/DashboardSidebar";
 import DashboardHeader from "@/components/DashboardHeader";
-import { peopleService } from "@/services/apiClient";
+import { collegeService } from "@/services/apiClient";
 
 export default function CollegeStudentsPage() {
   const [students, setStudents] = useState([]);
@@ -33,7 +33,7 @@ export default function CollegeStudentsPage() {
   useEffect(() => {
     let isMounted = true;
     setLoading(true);
-    peopleService.list({ role: "student" }).then((res) => {
+    collegeService.getStudents().then((res) => {
       if (isMounted && res && Array.isArray(res)) {
         const mapped = res.map((u) => ({
           id: u._id || u.id || "",

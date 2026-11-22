@@ -1,4 +1,4 @@
-import { userService } from '../services/userService.js';
+import { sanitizeDirectoryUser, userService } from '../services/userService.js';
 
 export const userController = {
   // Search and list students/candidates for People directory
@@ -26,12 +26,21 @@ export const userController = {
 
       res.json({
         success: true,
-        data: result.users,
+        data: result.users.map(sanitizeDirectoryUser),
         pagination: result.pagination,
       });
     } catch (error) {
       next(error);
     }
+  },
+
+  // Student emails and verification data require a trusted institution approval
+  // state. The current account model has no such state, so fail closed.
+  getCollegeStudents: async (_req, res) => {
+    return res.status(403).json({
+      success: false,
+      message: 'College roster access is unavailable until institution accounts can be verified',
+    });
   },
 
   // Get specific user public profile by ID

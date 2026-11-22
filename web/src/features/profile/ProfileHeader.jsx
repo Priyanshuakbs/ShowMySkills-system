@@ -1,13 +1,23 @@
 "use client";
 
-import { BadgeCheck, Pencil, Download } from "lucide-react";
+import { useRef } from "react";
+import { BadgeCheck, Pencil, Download, Camera } from "lucide-react";
 import StudentRoleTag from "@/components/StudentRoleTag";
 
 /**
  * ProfileHeader — Top card showing user identity, verification status,
  * action buttons, open-to-work status, and primary skill pills.
  */
-export default function ProfileHeader({ data }) {
+export default function ProfileHeader({
+  data,
+  onEdit,
+  onDownloadResume,
+  downloadingResume = false,
+  onAvatarFile,
+  uploadingAvatar = false,
+  avatarFeedback = "",
+}) {
+  const avatarInput = useRef(null);
   const initials = data.name
     .split(" ")
     .map((n) => n[0])
@@ -33,6 +43,27 @@ export default function ProfileHeader({ data }) {
               <span>{initials}</span>
             )}
           </div>
+          <input
+            ref={avatarInput}
+            type="file"
+            accept="image/jpeg,image/png,image/webp,image/svg+xml"
+            className="sr-only"
+            aria-label="Choose a profile photo"
+            onChange={(event) => {
+              onAvatarFile?.(event.target.files?.[0]);
+              event.target.value = "";
+            }}
+          />
+          <button
+            type="button"
+            title="Change profile photo"
+            aria-label="Change profile photo"
+            disabled={uploadingAvatar}
+            onClick={() => avatarInput.current?.click()}
+            className="absolute bottom-0 right-0 flex h-8 w-8 items-center justify-center rounded-full border-2 border-white bg-[#4B9C93] text-white shadow hover:bg-[#3d867e] disabled:cursor-wait disabled:opacity-60"
+          >
+            {uploadingAvatar ? <span className="text-[10px]">…</span> : <Camera className="h-4 w-4" />}
+          </button>
         </div>
 
         {/* ──── Info + Buttons ──── */}
@@ -75,22 +106,33 @@ export default function ProfileHeader({ data }) {
             <div className="flex items-center gap-2 shrink-0">
               <button
                 id="edit-profile-btn"
+                type="button"
+                onClick={onEdit}
                 className="px-4 py-2 rounded-lg border border-[#4B9C93] text-[#4B9C93] text-sm font-semibold hover:bg-[#4B9C93]/5 transition-colors cursor-pointer flex items-center gap-1.5"
               >
                 <Pencil className="w-3.5 h-3.5" />
                 Edit Profile
               </button>
-              <button
-                id="download-resume-btn"
-                className="px-4 py-2 rounded-lg bg-[#4B9C93] text-white text-sm font-semibold hover:bg-[#3d867e] transition-colors cursor-pointer flex items-center gap-1.5 shadow-sm shadow-[#4B9C93]/20"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Download Resume
-              </button>
+              {data.resumeUrl ? (
+                <button
+                  id="download-resume-btn"
+                  type="button"
+                  disabled={downloadingResume}
+                  onClick={onDownloadResume}
+                  className="px-4 py-2 rounded-lg bg-[#4B9C93] text-white text-sm font-semibold hover:bg-[#3d867e] transition-colors cursor-pointer flex items-center gap-1.5 shadow-sm shadow-[#4B9C93]/20 disabled:cursor-wait disabled:opacity-60"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  {downloadingResume ? "Preparing…" : "Download Resume"}
+                </button>
+              ) : (
+                <span className="rounded-lg border border-dashed border-gray-300 px-3 py-2 text-xs text-gray-500">No resume uploaded</span>
+              )}
             </div>
           </div>
         </div>
       </div>
+
+      {avatarFeedback && <p role="status" className="mt-3 text-xs font-medium text-gray-600">{avatarFeedback}</p>}
 
       {/* ──── Primary Skill Pills ──── */}
       <div className="flex flex-wrap gap-2 mt-5 pt-4 border-t border-gray-50">

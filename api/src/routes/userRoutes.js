@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { userController } from '../controllers/userController.js';
 import { authMiddleware } from '../middleware/authMiddleware.js';
+import { validateProfileUpdate } from '../validators/authValidator.js';
 
 const router = Router();
 
@@ -65,6 +66,10 @@ const router = Router();
  *                   $ref: '#/components/schemas/Pagination'
  */
 router.get('/', userController.getUsers);
+
+// Private college roster: email and verification status are not exposed by
+// the unauthenticated public directory route above.
+router.get('/college/students', authMiddleware, userController.getCollegeStudents);
 
 /**
  * @openapi
@@ -146,7 +151,7 @@ router.get('/', userController.getUsers);
  *       401:
  *         description: Unauthorized - Bearer token required
  */
-router.put('/profile', authMiddleware, userController.updateProfile);
+router.put('/profile', authMiddleware, validateProfileUpdate, userController.updateProfile);
 
 /**
  * @openapi

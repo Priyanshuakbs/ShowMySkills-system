@@ -14,6 +14,8 @@ import {
 } from './middleware/security.js';
 
 import authRoutes from './routes/authRoutes.js';
+import User from './models/User.js';
+import Application from './models/Application.js';
 import userRoutes from './routes/userRoutes.js';
 import internshipRoutes from './routes/internshipRoutes.js';
 import internshipActionRoutes from './routes/internshipActionRoutes.js';
@@ -31,6 +33,7 @@ import bookmarkRoutes from './routes/bookmarkRoutes.js';
 import monitoringRoutes from './routes/monitoringRoutes.js';
 import healthRoutes from './routes/healthRoutes.js';
 import { requestLogger } from './middleware/logger.js';
+import { authMiddleware } from './middleware/authMiddleware.js';
 import monitoringService from './services/monitoringService.js';
 
 const app = express();
@@ -54,7 +57,68 @@ app.use(noSqlSanitizer);
 app.use(xssSanitizer);
 app.use(hppProtection);
 
-// Static file serving for uploads with restricted caching & noSniff
+// Resume URLs retain their existing paths and download with a stable filename.
+const canonicalResumeReference = (filename) => {
+  const baseUrl = process.env.API_BASE_URL || `http://localhost:${process.env.PORT || 5000}/api`;
+  const rootUrl = baseUrl.replace(/\/api\/?$/, '');
+  return `${rootUrl}/uploads/resumes/${filename}`;
+};
+
+const authorizeResumeDownload = async (req, res, next) => {
+  let filename;
+  try {
+    const decodedPath = decodeURIComponent(req.path);
+    const match = decodedPath.match(/^\/([A-Za-z0-9_.-]+-[0-9]+-[0-9]+\.[A-Za-z0-9]+)$/);
+    if (!match || req.path.includes('%')) return res.sendStatus(404);
+    filename = match[1];
+  } catch {
+    return res.sendStatus(404);
+  }
+
+  try {
+    const resumeReference = canonicalResumeReference(filename);
+    const isOwner = await User.exists({ _id: req.user.id, resumeUrl: resumeReference });
+    if (isOwner) return next();
+
+    if (req.user.role !== 'company') return res.sendStatus(404);
+
+    const applicantIds = await Application.distinct('student', {
+      company: req.user.id,
+      'candidateSnapshot.resumeUrl': resumeReference,
+    });
+    if (!applicantIds.length) return res.sendStatus(404);
+
+    // Snapshots are historical display data and are not proof of file ownership.
+    // Confirm the referenced resume is still the canonical resume of the
+    // student attached to this company application before granting access.
+    const applicantOwnsResume = await User.exists({
+      _id: { $in: applicantIds },
+      resumeUrl: resumeReference,
+    });
+    if (!applicantOwnsResume) return res.sendStatus(404);
+    next();
+  } catch (error) {
+    next(error);
+  }
+};
+
+app.use(
+  '/uploads/resumes',
+  authMiddleware,
+  authorizeResumeDownload,
+  express.static(path.join(process.cwd(), 'uploads', 'resumes'), {
+    dotfiles: 'deny',
+    index: false,
+    maxAge: '1d',
+    setHeaders: (res, filePath) => {
+      const filename = path.basename(filePath).replace(/["\\\r\n]/g, '_');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.setHeader('Cache-Control', 'private, no-store');
+    },
+  })
+);
+
+// Static file serving for other uploads with restricted caching & noSniff
 app.use(
   '/uploads',
   express.static(path.join(process.cwd(), 'uploads'), {

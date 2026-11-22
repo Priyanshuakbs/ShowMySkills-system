@@ -6,6 +6,21 @@ import { uploadController } from '../api/src/controllers/uploadController.js';
 import { userService } from '../api/src/services/userService.js';
 import { uploadService as webUploadService } from '../web/src/services/apiClient.js';
 
+const stubCompanyProfileRead = () => {
+  const originalFindById = User.findById;
+  User.findById = () => ({
+    select: async () => ({
+      role: 'company',
+      name: 'Acme Corp',
+      location: 'Bengaluru',
+      companyProfile: { companyName: 'Acme Corp', tagline: 'Building the Future' },
+    }),
+  });
+  return () => {
+    User.findById = originalFindById;
+  };
+};
+
 // Client-side logo validation logic mirroring CompanyProfilePage
 const validateLogoFile = (file) => {
   const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/svg+xml'];
@@ -154,14 +169,14 @@ test('Logo Upload Controller: rejects requests with no file', async () => {
 });
 
 test('Logo Upload Controller: saves logo to User and returns formatted URL', async () => {
-  const originalFindByIdAndUpdate = User.findByIdAndUpdate;
+  const originalUpdateProfile = userService.updateProfile;
   let updatedUserId = null;
   let updatePayload = null;
 
-  User.findByIdAndUpdate = async (id, update) => {
+  userService.updateProfile = async (id, update) => {
     updatedUserId = id;
     updatePayload = update;
-    return { _id: id };
+    return { _id: id, profileIcon: update.companyProfile.logo, completionPercentage: 65 };
   };
 
   try {
@@ -193,14 +208,15 @@ test('Logo Upload Controller: saves logo to User and returns formatted URL', asy
     assert.strictEqual(jsonResponse.success, true);
     assert.match(jsonResponse.data.url, /\/uploads\/company-logos\/acme-logo-12345\.png/);
     assert.strictEqual(updatedUserId, '64f1a2b3c4d5e6f7a8b9c111');
-    assert.match(updatePayload.$set['companyProfile.logo'], /\/uploads\/company-logos\/acme-logo-12345\.png/);
-    assert.match(updatePayload.$set.profileIcon, /\/uploads\/company-logos\/acme-logo-12345\.png/);
+    assert.match(updatePayload.companyProfile.logo, /\/uploads\/company-logos\/acme-logo-12345\.png/);
+    assert.strictEqual(jsonResponse.data.completionPercentage, 65);
   } finally {
-    User.findByIdAndUpdate = originalFindByIdAndUpdate;
+    userService.updateProfile = originalUpdateProfile;
   }
 });
 
 test('User Service: updateProfile persists logo and profileIcon', async () => {
+  const restoreFindById = stubCompanyProfileRead();
   const originalFindByIdAndUpdate = User.findByIdAndUpdate;
   let updatedPayload = null;
 
@@ -236,6 +252,7 @@ test('User Service: updateProfile persists logo and profileIcon', async () => {
       'https://example.com/uploads/company-logos/test-logo.png'
     );
   } finally {
+    restoreFindById();
     User.findByIdAndUpdate = originalFindByIdAndUpdate;
   }
 });
@@ -243,6 +260,7 @@ test('User Service: updateProfile persists logo and profileIcon', async () => {
 // ──── 3. Replacing an existing logo ────
 
 test('Replacing Logo: updateProfile replaces old logo and preserves other profile fields', async () => {
+  const restoreFindById = stubCompanyProfileRead();
   const originalFindByIdAndUpdate = User.findByIdAndUpdate;
   let capturedUpdate = null;
 
@@ -277,6 +295,7 @@ test('Replacing Logo: updateProfile replaces old logo and preserves other profil
     assert.strictEqual(capturedUpdate.$set.profileIcon, newLogoUrl);
     assert.strictEqual(result.companyProfile.logo, newLogoUrl);
   } finally {
+    restoreFindById();
     User.findByIdAndUpdate = originalFindByIdAndUpdate;
   }
 });
@@ -284,6 +303,7 @@ test('Replacing Logo: updateProfile replaces old logo and preserves other profil
 // ──── 4. Removing a logo and restoring the default placeholder ────
 
 test('Removing Logo: updateProfile with empty logo clears companyProfile.logo and profileIcon', async () => {
+  const restoreFindById = stubCompanyProfileRead();
   const originalFindByIdAndUpdate = User.findByIdAndUpdate;
   let capturedUpdate = null;
 
@@ -316,6 +336,7 @@ test('Removing Logo: updateProfile with empty logo clears companyProfile.logo an
     assert.strictEqual(headerElement.icon, 'Building2');
     assert.strictEqual(headerElement.badge, 'Partner');
   } finally {
+    restoreFindById();
     User.findByIdAndUpdate = originalFindByIdAndUpdate;
   }
 });
@@ -474,6 +495,7 @@ test('Establishment Year Validation: accepts valid 4-digit year and rejects inva
 });
 
 test('User Service: updateProfile persists establishedYear and companySize', async () => {
+  const restoreFindById = stubCompanyProfileRead();
   const originalFindByIdAndUpdate = User.findByIdAndUpdate;
   let capturedUpdate = null;
 
@@ -502,11 +524,13 @@ test('User Service: updateProfile persists establishedYear and companySize', asy
     assert.strictEqual(res.companyProfile.establishedYear, 2019);
     assert.strictEqual(res.companyProfile.companySize, '51–200');
   } finally {
+    restoreFindById();
     User.findByIdAndUpdate = originalFindByIdAndUpdate;
   }
 });
 
 test('User Service: updateProfile clears establishedYear and companySize when empty', async () => {
+  const restoreFindById = stubCompanyProfileRead();
   const originalFindByIdAndUpdate = User.findByIdAndUpdate;
   let capturedUpdate = null;
 
@@ -535,6 +559,7 @@ test('User Service: updateProfile clears establishedYear and companySize when em
     assert.strictEqual(res.companyProfile.establishedYear, null);
     assert.strictEqual(res.companyProfile.companySize, '');
   } finally {
+    restoreFindById();
     User.findByIdAndUpdate = originalFindByIdAndUpdate;
   }
 });
