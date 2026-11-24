@@ -1,55 +1,51 @@
-import fs from 'node:fs/promises';
-import path from 'node:path';
+import fs from 'node:fs';
 import { formatFileUrl } from '../services/uploadService.js';
+import storageService from '../services/storageService.js';
 import User from '../models/User.js';
-import Application from '../models/Application.js';
-import { logger } from '../utils/logger.js';
-import { userService } from '../services/userService.js';
+import Internship from '../models/Internship.js';
 
-const removeNewUpload = async (filePath) => {
-  if (!filePath) return;
+/**
+ * Silently delete an old file from centralized storage.
+ * Never throws — just warns on failure.
+ */
+async function deleteOldFileFromStorage(fileId, userId) {
+  if (!fileId || !storageService.isConfigured()) return;
   try {
-    await fs.unlink(filePath);
-  } catch (error) {
-    if (error.code !== 'ENOENT') logger.warn('Could not remove failed upload file', error.message);
+    await storageService.deleteFile(fileId, userId);
+  } catch (err) {
+    console.warn(`[StorageService] Failed to delete old file ${fileId}:`, err.message);
   }
-};
+}
 
-const getLocalResumePath = (resumeUrl) => {
-  if (!resumeUrl || typeof resumeUrl !== 'string') return null;
-  try {
-    const pathname = new URL(resumeUrl, 'http://localhost').pathname;
-    const match = pathname.match(/^\/uploads\/resumes\/([^/]+)$/);
-    if (!match) return null;
+/**
+ * Helper to upload a locally-saved multer file to XyphX Centralized Storage
+ * with automatic fallback to local URL if offline or unconfigured.
+ */
+async function processUploadToCentralizedStorage(req, subfolder) {
+  let fileUrl = formatFileUrl(req, req.file, subfolder);
+  let fileId = null;
 
-    const filename = decodeURIComponent(match[1]);
-    if (!filename || filename === '.' || filename === '..') return null;
-    const resumeDirectory = path.resolve(process.cwd(), 'uploads', 'resumes');
-    const filePath = path.resolve(resumeDirectory, filename);
-    return filePath.startsWith(`${resumeDirectory}${path.sep}`) ? filePath : null;
-  } catch {
-    return null;
+  if (storageService.isConfigured() && req.file?.path) {
+    try {
+      const buffer = await fs.promises.readFile(req.file.path);
+      const userId = req.user?.id || 'usr_anonymous';
+      const result = await storageService.uploadFile({
+        userId,
+        buffer,
+        fileName: req.file.originalname || req.file.filename,
+        mimeType: req.file.mimetype,
+      });
+      if (result?.url) {
+        fileUrl = result.url;
+        fileId = result.fileId;
+      }
+    } catch (storageErr) {
+      console.warn(`[StorageService] Centralized upload fallback to local for ${subfolder}:`, storageErr.message);
+    }
   }
-};
 
-const removeUnreferencedOldResume = async (resumeUrl, userId) => {
-  const filePath = getLocalResumePath(resumeUrl);
-  if (!filePath) return;
-
-  try {
-    const otherReferences = await User.countDocuments({
-      resumeUrl,
-      _id: { $ne: userId },
-    });
-    const applicationReferences = await Application.countDocuments({
-      'candidateSnapshot.resumeUrl': resumeUrl,
-    });
-    if (otherReferences > 0 || applicationReferences > 0) return;
-    await fs.unlink(filePath);
-  } catch (error) {
-    if (error.code !== 'ENOENT') logger.warn('Could not remove replaced resume file', error.message);
-  }
-};
+  return { fileUrl, fileId };
+}
 
 export const uploadController = {
   // Upload user avatar & optionally attach to profileIcon
@@ -59,13 +55,19 @@ export const uploadController = {
         return res.status(400).json({ success: false, message: 'No avatar image uploaded' });
       }
 
-      const fileUrl = formatFileUrl(req, req.file, 'avatars');
+      // Delete old avatar from centralized storage before replacing
+      if (req.user?.id) {
+        const existing = await User.findById(req.user.id).select('profileIconFileId').lean();
+        await deleteOldFileFromStorage(existing?.profileIconFileId, req.user.id);
+      }
 
-      const updatedUser = await userService.updateProfile(req.user.id, { profileIcon: fileUrl });
+      const { fileUrl, fileId } = await processUploadToCentralizedStorage(req, 'avatars');
 
-      if (!updatedUser) {
-        await removeNewUpload(req.file.path);
-        return res.status(404).json({ success: false, message: 'User not found' });
+      // If user is logged in, auto-update profileIcon
+      if (req.user?.id) {
+        const updateFields = { profileIcon: fileUrl };
+        if (fileId) updateFields.profileIconFileId = fileId;
+        await User.findByIdAndUpdate(req.user.id, { $set: updateFields });
       }
 
       res.status(201).json({
@@ -73,8 +75,7 @@ export const uploadController = {
         message: 'Avatar uploaded successfully',
         data: {
           url: fileUrl,
-          profileIcon: updatedUser.profileIcon,
-          completionPercentage: updatedUser.completionPercentage,
+          fileId,
           filename: req.file.filename,
           size: req.file.size,
           mimetype: req.file.mimetype,
@@ -98,22 +99,18 @@ export const uploadController = {
         return res.status(401).json({ success: false, message: 'Authentication is required to upload a resume' });
       }
 
-      const fileUrl = formatFileUrl(req, req.file, 'resumes');
-      const existingUser = await User.findById(req.user.id).select('resumeUrl');
-      if (!existingUser) {
-        await removeNewUpload(req.file.path);
-        return res.status(404).json({ success: false, message: 'User not found' });
+      // Delete old resume from centralized storage before replacing
+      if (req.user?.id) {
+        const existing = await User.findById(req.user.id).select('resumeFileId').lean();
+        await deleteOldFileFromStorage(existing?.resumeFileId, req.user.id);
       }
 
-      const updatedUser = await userService.updateResume(req.user.id, fileUrl);
+      const { fileUrl, fileId } = await processUploadToCentralizedStorage(req, 'resumes');
 
-      if (!updatedUser) {
-        await removeNewUpload(req.file.path);
-        return res.status(404).json({ success: false, message: 'User not found' });
-      }
-
-      if (existingUser.resumeUrl && existingUser.resumeUrl !== updatedUser.resumeUrl) {
-        await removeUnreferencedOldResume(existingUser.resumeUrl, req.user.id);
+      if (req.user?.id) {
+        const updateFields = { resumeUrl: fileUrl };
+        if (fileId) updateFields.resumeFileId = fileId;
+        await User.findByIdAndUpdate(req.user.id, { $set: updateFields });
       }
 
       res.status(201).json({
@@ -121,8 +118,7 @@ export const uploadController = {
         message: 'Resume uploaded successfully',
         data: {
           url: fileUrl,
-          resumeUrl: updatedUser.resumeUrl,
-          completionPercentage: updatedUser.completionPercentage,
+          fileId,
           filename: req.file.filename,
           size: req.file.size,
         },
@@ -140,13 +136,14 @@ export const uploadController = {
         return res.status(400).json({ success: false, message: 'No certificate document uploaded' });
       }
 
-      const fileUrl = formatFileUrl(req, req.file, 'certificates');
+      const { fileUrl, fileId } = await processUploadToCentralizedStorage(req, 'certificates');
 
       res.status(201).json({
         success: true,
         message: 'Certificate uploaded successfully',
         data: {
           url: fileUrl,
+          fileId,
           filename: req.file.filename,
         },
       });
@@ -162,13 +159,25 @@ export const uploadController = {
         return res.status(400).json({ success: false, message: 'No logo image uploaded' });
       }
 
-      const fileUrl = formatFileUrl(req, req.file, 'company-logos');
-
-      let updatedUser = null;
+      // Delete old logo from centralized storage before replacing
       if (req.user?.id) {
-        updatedUser = await userService.updateProfile(req.user.id, {
-          companyProfile: { logo: fileUrl },
-        });
+        const existing = await User.findById(req.user.id).select('companyProfile.logoFileId profileIconFileId').lean();
+        const oldFileId = existing?.companyProfile?.logoFileId || existing?.profileIconFileId;
+        await deleteOldFileFromStorage(oldFileId, req.user.id);
+      }
+
+      const { fileUrl, fileId } = await processUploadToCentralizedStorage(req, 'company-logos');
+
+      if (req.user?.id) {
+        const updateFields = {
+          'companyProfile.logo': fileUrl,
+          profileIcon: fileUrl,
+        };
+        if (fileId) {
+          updateFields['companyProfile.logoFileId'] = fileId;
+          updateFields.profileIconFileId = fileId;
+        }
+        await User.findByIdAndUpdate(req.user.id, { $set: updateFields });
       }
 
       res.status(201).json({
@@ -176,7 +185,7 @@ export const uploadController = {
         message: 'Company logo uploaded successfully',
         data: {
           url: fileUrl,
-          ...(updatedUser ? { completionPercentage: updatedUser.completionPercentage } : {}),
+          fileId,
           filename: req.file.filename,
         },
       });
@@ -192,13 +201,14 @@ export const uploadController = {
         return res.status(400).json({ success: false, message: 'No attachment uploaded' });
       }
 
-      const fileUrl = formatFileUrl(req, req.file, 'chat-attachments');
+      const { fileUrl, fileId } = await processUploadToCentralizedStorage(req, 'chat-attachments');
 
       res.status(201).json({
         success: true,
         message: 'Chat attachment uploaded successfully',
         data: {
           url: fileUrl,
+          fileId,
           filename: req.file.filename,
           size: req.file.size,
           mimetype: req.file.mimetype,
@@ -216,13 +226,14 @@ export const uploadController = {
         return res.status(400).json({ success: false, message: 'No poster image uploaded' });
       }
 
-      const fileUrl = formatFileUrl(req, req.file, 'internship-posters');
+      const { fileUrl, fileId } = await processUploadToCentralizedStorage(req, 'internship-posters');
 
       res.status(201).json({
         success: true,
         message: 'Internship poster uploaded successfully',
         data: {
           url: fileUrl,
+          fileId,
           filename: req.file.filename,
           size: req.file.size,
           mimetype: req.file.mimetype,
@@ -233,3 +244,5 @@ export const uploadController = {
     }
   },
 };
+
+export default uploadController;
