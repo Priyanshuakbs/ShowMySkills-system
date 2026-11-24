@@ -1,8 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import User from '../api/src/models/User.js';
 import { uploadCompanyLogo } from '../api/src/services/uploadService.js';
 import { uploadController } from '../api/src/controllers/uploadController.js';
+import storageService from '../api/src/services/storageService.js';
 import { userService } from '../api/src/services/userService.js';
 import { uploadService as webUploadService } from '../web/src/services/apiClient.js';
 
@@ -170,6 +174,8 @@ test('Logo Upload Controller: rejects requests with no file', async () => {
 
 test('Logo Upload Controller: saves logo to User and returns formatted URL', async () => {
   const originalUpdateProfile = userService.updateProfile;
+  const originalFindById = User.findById;
+  const originalFindByIdAndUpdate = User.findByIdAndUpdate;
   let updatedUserId = null;
   let updatePayload = null;
 
@@ -178,6 +184,8 @@ test('Logo Upload Controller: saves logo to User and returns formatted URL', asy
     updatePayload = update;
     return { _id: id, profileIcon: update.companyProfile.logo, completionPercentage: 65 };
   };
+  User.findById = () => ({ select: () => ({ lean: async () => ({}) }) });
+  User.findByIdAndUpdate = async () => ({});
 
   try {
     let statusCode = null;
@@ -209,9 +217,209 @@ test('Logo Upload Controller: saves logo to User and returns formatted URL', asy
     assert.match(jsonResponse.data.url, /\/uploads\/company-logos\/acme-logo-12345\.png/);
     assert.strictEqual(updatedUserId, '64f1a2b3c4d5e6f7a8b9c111');
     assert.match(updatePayload.companyProfile.logo, /\/uploads\/company-logos\/acme-logo-12345\.png/);
+    assert.match(updatePayload.profileIcon, /\/uploads\/company-logos\/acme-logo-12345\.png/);
     assert.strictEqual(jsonResponse.data.completionPercentage, 65);
   } finally {
     userService.updateProfile = originalUpdateProfile;
+    User.findById = originalFindById;
+    User.findByIdAndUpdate = originalFindByIdAndUpdate;
+  }
+});
+
+test('Logo Upload Controller: persists logo to company and avatar fields with both centralized IDs', async () => {
+  const originals = {
+    findById: User.findById,
+    findByIdAndUpdate: User.findByIdAndUpdate,
+    updateProfile: userService.updateProfile,
+    isConfigured: storageService.isConfigured,
+    uploadFile: storageService.uploadFile,
+    deleteFile: storageService.deleteFile,
+  };
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'company-logo-central-'));
+  const filePath = path.join(directory, 'logo.png');
+  await fs.writeFile(filePath, 'logo');
+  const fileUrl = 'https://storage.example/logo-file';
+  let profileUpdate;
+  let metadataUpdate;
+  const operationOrder = [];
+  let deletedIds = [];
+  User.findById = () => ({ select: () => ({ lean: async () => ({ companyProfile: { logoFileId: 'old-logo' }, profileIconFileId: 'old-avatar' }) }) });
+  User.findByIdAndUpdate = (_id, update) => { operationOrder.push('metadata'); metadataUpdate = update; return Promise.resolve({}); };
+  userService.updateProfile = async (_id, update) => {
+    operationOrder.push('profile');
+    profileUpdate = update;
+    return { _id, companyProfile: { logo: fileUrl }, profileIcon: fileUrl, completionPercentage: 72 };
+  };
+  storageService.isConfigured = () => true;
+  storageService.uploadFile = async () => ({ url: fileUrl, fileId: 'new-logo-id' });
+  storageService.deleteFile = async (fileId) => { operationOrder.push('delete-old'); deletedIds.push(fileId); };
+  try {
+    const res = { statusCode: 200, status(code) { this.statusCode = code; return this; }, json(body) { this.body = body; return this; } };
+    await uploadController.handleLogoUpload({
+      user: { id: 'company-1' },
+      file: { filename: 'logo.png', path: filePath, originalname: 'logo.png', size: 4, mimetype: 'image/png' },
+    }, res, assert.fail);
+    assert.deepEqual(profileUpdate, { companyProfile: { logo: fileUrl }, profileIcon: fileUrl });
+    assert.deepEqual(metadataUpdate.$set, { 'companyProfile.logoFileId': 'new-logo-id', profileIconFileId: 'new-logo-id' });
+    assert.equal(res.body.data.completionPercentage, 72);
+    assert.deepEqual(deletedIds, ['old-logo', 'old-avatar']);
+    assert.deepEqual(operationOrder, ['profile', 'metadata', 'delete-old', 'delete-old']);
+    await assert.rejects(fs.access(filePath), { code: 'ENOENT' });
+  } finally {
+    User.findById = originals.findById;
+    User.findByIdAndUpdate = originals.findByIdAndUpdate;
+    userService.updateProfile = originals.updateProfile;
+    storageService.isConfigured = originals.isConfigured;
+    storageService.uploadFile = originals.uploadFile;
+    storageService.deleteFile = originals.deleteFile;
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('Logo Upload Controller: deletes an identical old file ID only once', async () => {
+  const originals = {
+    findById: User.findById,
+    findByIdAndUpdate: User.findByIdAndUpdate,
+    updateProfile: userService.updateProfile,
+    isConfigured: storageService.isConfigured,
+    uploadFile: storageService.uploadFile,
+    deleteFile: storageService.deleteFile,
+  };
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'company-logo-identical-'));
+  const filePath = path.join(directory, 'logo.png');
+  await fs.writeFile(filePath, 'logo');
+  const deletedIds = [];
+  User.findById = () => ({ select: () => ({ lean: async () => ({ companyProfile: { logoFileId: 'shared-old-id' }, profileIconFileId: 'shared-old-id' }) }) });
+  User.findByIdAndUpdate = async () => ({});
+  userService.updateProfile = async () => ({ profileIcon: 'https://storage.example/new-logo', completionPercentage: 72 });
+  storageService.isConfigured = () => true;
+  storageService.uploadFile = async () => ({ url: 'https://storage.example/new-logo', fileId: 'new-logo-id' });
+  storageService.deleteFile = async (fileId) => { deletedIds.push(fileId); };
+  try {
+    const res = { status: () => res, json: (body) => { res.body = body; return res; } };
+    await uploadController.handleLogoUpload({ user: { id: 'company-1' }, file: { filename: 'logo.png', path: filePath, originalname: 'logo.png', mimetype: 'image/png' } }, res, assert.fail);
+    assert.deepEqual(deletedIds, ['shared-old-id']);
+    await assert.rejects(fs.access(filePath), { code: 'ENOENT' });
+  } finally {
+    User.findById = originals.findById;
+    User.findByIdAndUpdate = originals.findByIdAndUpdate;
+    userService.updateProfile = originals.updateProfile;
+    storageService.isConfigured = originals.isConfigured;
+    storageService.uploadFile = originals.uploadFile;
+    storageService.deleteFile = originals.deleteFile;
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('Logo Upload Controller: metadata failure preserves centralized files and removes local temp file', async () => {
+  const originals = {
+    findById: User.findById,
+    findByIdAndUpdate: User.findByIdAndUpdate,
+    updateProfile: userService.updateProfile,
+    isConfigured: storageService.isConfigured,
+    uploadFile: storageService.uploadFile,
+    deleteFile: storageService.deleteFile,
+  };
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'company-logo-metadata-fail-'));
+  const filePath = path.join(directory, 'logo.png');
+  await fs.writeFile(filePath, 'logo');
+  const deletedIds = [];
+  User.findById = () => ({ select: () => ({ lean: async () => ({ companyProfile: { logoFileId: 'old-logo' } }) }) });
+  User.findByIdAndUpdate = () => { throw new Error('metadata write failed'); };
+  userService.updateProfile = async () => ({ profileIcon: 'https://storage.example/new-logo' });
+  storageService.isConfigured = () => true;
+  storageService.uploadFile = async () => ({ url: 'https://storage.example/new-logo', fileId: 'new-logo' });
+  storageService.deleteFile = async (fileId) => { deletedIds.push(fileId); };
+  try {
+    let forwarded;
+    await uploadController.handleLogoUpload({ user: { id: 'company-1' }, file: { filename: 'logo.png', path: filePath, originalname: 'logo.png', mimetype: 'image/png' } }, {}, (error) => { forwarded = error; });
+    assert.match(forwarded.message, /metadata write failed/);
+    await assert.rejects(fs.access(filePath), { code: 'ENOENT' });
+    assert.deepEqual(deletedIds, []);
+  } finally {
+    User.findById = originals.findById;
+    User.findByIdAndUpdate = originals.findByIdAndUpdate;
+    userService.updateProfile = originals.updateProfile;
+    storageService.isConfigured = originals.isConfigured;
+    storageService.uploadFile = originals.uploadFile;
+    storageService.deleteFile = originals.deleteFile;
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('Logo Upload Controller: local fallback preserves the profile-referenced upload file', async () => {
+  const originals = {
+    findById: User.findById,
+    findByIdAndUpdate: User.findByIdAndUpdate,
+    updateProfile: userService.updateProfile,
+    isConfigured: storageService.isConfigured,
+    uploadFile: storageService.uploadFile,
+    deleteFile: storageService.deleteFile,
+  };
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'company-logo-fallback-'));
+  const filePath = path.join(directory, 'logo.png');
+  await fs.writeFile(filePath, 'logo');
+  const operations = [];
+  let profilePayload;
+  let metadataPayload;
+  User.findById = () => ({ select: () => ({ lean: async () => ({ companyProfile: { logoFileId: 'old-logo' }, profileIconFileId: 'old-avatar' }) }) });
+  User.findByIdAndUpdate = async (_id, update) => { operations.push('metadata'); metadataPayload = update; return {}; };
+  userService.updateProfile = async (_id, update) => { operations.push('profile'); profilePayload = update; return { profileIcon: update.profileIcon, completionPercentage: 72 }; };
+  storageService.isConfigured = () => true;
+  storageService.uploadFile = async () => { throw new Error('storage unavailable'); };
+  storageService.deleteFile = async (fileId) => { operations.push(`delete:${fileId}`); };
+  try {
+    const res = { statusCode: 200, status(code) { this.statusCode = code; return this; }, json(body) { this.body = body; return this; } };
+    await uploadController.handleLogoUpload({ user: { id: 'company-1' }, file: { filename: 'logo.png', path: filePath, size: 4, mimetype: 'image/png' } }, res, assert.fail);
+    assert.equal(res.statusCode, 201);
+    assert.deepEqual(profilePayload, { companyProfile: { logo: res.body.data.url }, profileIcon: res.body.data.url });
+    assert.deepEqual(metadataPayload.$unset, { 'companyProfile.logoFileId': 1, profileIconFileId: 1 });
+    assert.deepEqual(operations, ['profile', 'metadata', 'delete:old-logo', 'delete:old-avatar']);
+    assert.equal(await fs.readFile(filePath, 'utf8'), 'logo');
+  } finally {
+    User.findById = originals.findById;
+    User.findByIdAndUpdate = originals.findByIdAndUpdate;
+    userService.updateProfile = originals.updateProfile;
+    storageService.isConfigured = originals.isConfigured;
+    storageService.uploadFile = originals.uploadFile;
+    storageService.deleteFile = originals.deleteFile;
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('Logo Upload Controller: failed fallback metadata removal preserves old centralized files', async () => {
+  const originals = {
+    findById: User.findById,
+    findByIdAndUpdate: User.findByIdAndUpdate,
+    updateProfile: userService.updateProfile,
+    isConfigured: storageService.isConfigured,
+    uploadFile: storageService.uploadFile,
+    deleteFile: storageService.deleteFile,
+  };
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'company-logo-unset-failure-'));
+  const filePath = path.join(directory, 'logo.png');
+  await fs.writeFile(filePath, 'logo');
+  const deletedIds = [];
+  User.findById = () => ({ select: () => ({ lean: async () => ({ companyProfile: { logoFileId: 'old-logo' }, profileIconFileId: 'old-avatar' }) }) });
+  User.findByIdAndUpdate = () => { throw new Error('metadata removal failed'); };
+  userService.updateProfile = async (_id, update) => ({ profileIcon: update.profileIcon, companyProfile: { logo: update.companyProfile.logo } });
+  storageService.isConfigured = () => true;
+  storageService.uploadFile = async () => { throw new Error('storage unavailable'); };
+  storageService.deleteFile = async (fileId) => { deletedIds.push(fileId); };
+  try {
+    let forwarded;
+    await uploadController.handleLogoUpload({ user: { id: 'company-1' }, file: { filename: 'logo.png', path: filePath, originalname: 'logo.png', mimetype: 'image/png' } }, {}, (error) => { forwarded = error; });
+    assert.match(forwarded.message, /metadata removal failed/);
+    assert.deepEqual(deletedIds, []);
+    assert.equal(await fs.readFile(filePath, 'utf8'), 'logo');
+  } finally {
+    User.findById = originals.findById;
+    User.findByIdAndUpdate = originals.findByIdAndUpdate;
+    userService.updateProfile = originals.updateProfile;
+    storageService.isConfigured = originals.isConfigured;
+    storageService.uploadFile = originals.uploadFile;
+    storageService.deleteFile = originals.deleteFile;
+    await fs.rm(directory, { recursive: true, force: true });
   }
 });
 

@@ -10,6 +10,7 @@ import uploadRoutes from '../src/routes/uploadRoutes.js';
 import { uploadAvatar } from '../src/services/uploadService.js';
 import { authMiddleware } from '../src/middleware/authMiddleware.js';
 import { userService } from '../src/services/userService.js';
+import storageService from '../src/services/storageService.js';
 import { validateProfileUpdate } from '../src/validators/authValidator.js';
 
 const mockResponse = () => ({
@@ -116,10 +117,12 @@ test('avatar upload persists profileIcon and returns its saved value', async () 
 });
 
 test('avatar upload removes the new file when profile persistence fails', async () => {
+  const originalFindById = User.findById;
   const originalUpdateProfile = userService.updateProfile;
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'showmyskills-avatar-'));
   const filePath = path.join(directory, 'new-avatar.png');
   await fs.writeFile(filePath, 'avatar');
+  User.findById = () => ({ select: () => ({ lean: async () => ({ profileIconFileId: null }) }) });
   userService.updateProfile = async () => {
     throw new Error('database unavailable');
   };
@@ -137,16 +140,19 @@ test('avatar upload removes the new file when profile persistence fails', async 
     assert.match(forwardedError.message, /database unavailable/);
     await assert.rejects(fs.access(filePath), { code: 'ENOENT' });
   } finally {
+    User.findById = originalFindById;
     userService.updateProfile = originalUpdateProfile;
     await fs.rm(directory, { recursive: true, force: true });
   }
 });
 
 test('avatar upload removes the new file when the authenticated user is missing', async () => {
+  const originalFindById = User.findById;
   const originalUpdateProfile = userService.updateProfile;
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'showmyskills-avatar-'));
   const filePath = path.join(directory, 'orphan-avatar.png');
   await fs.writeFile(filePath, 'avatar');
+  User.findById = () => ({ select: () => ({ lean: async () => ({ profileIconFileId: null }) }) });
   userService.updateProfile = async () => null;
 
   try {
@@ -160,7 +166,160 @@ test('avatar upload removes the new file when the authenticated user is missing'
     assert.equal(res.body.success, false);
     await assert.rejects(fs.access(filePath), { code: 'ENOENT' });
   } finally {
+    User.findById = originalFindById;
     userService.updateProfile = originalUpdateProfile;
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('avatar metadata failure preserves centralized files and removes the local temporary file', async () => {
+  const originals = {
+    findById: User.findById,
+    findByIdAndUpdate: User.findByIdAndUpdate,
+    updateProfile: userService.updateProfile,
+    isConfigured: storageService.isConfigured,
+    uploadFile: storageService.uploadFile,
+    deleteFile: storageService.deleteFile,
+  };
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'showmyskills-avatar-metadata-'));
+  const filePath = path.join(directory, 'avatar.png');
+  await fs.writeFile(filePath, 'avatar');
+  const deletedIds = [];
+  User.findById = () => ({ select: () => ({ lean: async () => ({ profileIconFileId: 'old-avatar' }) }) });
+  User.findByIdAndUpdate = () => { throw new Error('metadata write failed'); };
+  userService.updateProfile = async () => ({ profileIcon: 'https://storage.example/new-avatar' });
+  storageService.isConfigured = () => true;
+  storageService.uploadFile = async () => ({ url: 'https://storage.example/new-avatar', fileId: 'new-avatar' });
+  storageService.deleteFile = async (fileId) => { deletedIds.push(fileId); };
+  try {
+    let forwarded;
+    await uploadController.handleAvatarUpload({
+      user: { id: 'student-1' },
+      file: { filename: 'avatar.png', path: filePath, originalname: 'avatar.png', mimetype: 'image/png' },
+    }, mockResponse(), (error) => { forwarded = error; });
+    assert.match(forwarded.message, /metadata write failed/);
+    await assert.rejects(fs.access(filePath), { code: 'ENOENT' });
+    assert.deepEqual(deletedIds, []);
+  } finally {
+    User.findById = originals.findById;
+    User.findByIdAndUpdate = originals.findByIdAndUpdate;
+    userService.updateProfile = originals.updateProfile;
+    storageService.isConfigured = originals.isConfigured;
+    storageService.uploadFile = originals.uploadFile;
+    storageService.deleteFile = originals.deleteFile;
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('avatar centralized upload removes its local temporary file after profile and metadata persistence', async () => {
+  const originals = {
+    findById: User.findById,
+    findByIdAndUpdate: User.findByIdAndUpdate,
+    updateProfile: userService.updateProfile,
+    isConfigured: storageService.isConfigured,
+    uploadFile: storageService.uploadFile,
+    deleteFile: storageService.deleteFile,
+  };
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'showmyskills-avatar-central-'));
+  const filePath = path.join(directory, 'avatar.png');
+  await fs.writeFile(filePath, 'avatar');
+  User.findById = () => ({ select: () => ({ lean: async () => ({ profileIconFileId: '' }) }) });
+  User.findByIdAndUpdate = async () => ({});
+  userService.updateProfile = async () => ({ profileIcon: 'https://storage.example/avatar', completionPercentage: 20 });
+  storageService.isConfigured = () => true;
+  storageService.uploadFile = async () => ({ url: 'https://storage.example/avatar', fileId: 'avatar-id' });
+  storageService.deleteFile = async () => {};
+  try {
+    const res = mockResponse();
+    await uploadController.handleAvatarUpload({ user: { id: 'student-1' }, file: { filename: 'avatar.png', path: filePath, originalname: 'avatar.png', mimetype: 'image/png' } }, res, assert.fail);
+    assert.equal(res.statusCode, 201);
+    await assert.rejects(fs.access(filePath), { code: 'ENOENT' });
+  } finally {
+    User.findById = originals.findById;
+    User.findByIdAndUpdate = originals.findByIdAndUpdate;
+    userService.updateProfile = originals.updateProfile;
+    storageService.isConfigured = originals.isConfigured;
+    storageService.uploadFile = originals.uploadFile;
+    storageService.deleteFile = originals.deleteFile;
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('avatar local fallback keeps the temporary file used by the saved profile URL', async () => {
+  const originals = {
+    findById: User.findById,
+    findByIdAndUpdate: User.findByIdAndUpdate,
+    updateProfile: userService.updateProfile,
+    isConfigured: storageService.isConfigured,
+    uploadFile: storageService.uploadFile,
+    deleteFile: storageService.deleteFile,
+  };
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'showmyskills-avatar-fallback-'));
+  const filePath = path.join(directory, 'avatar.png');
+  await fs.writeFile(filePath, 'avatar');
+  const operations = [];
+  User.findById = () => ({ select: () => ({ lean: async () => ({ profileIconFileId: 'old-avatar-id' }) }) });
+  User.findByIdAndUpdate = async (_id, update) => { operations.push(['metadata', update]); };
+  userService.updateProfile = async (_id, data) => ({ profileIcon: data.profileIcon, completionPercentage: 20 });
+  storageService.isConfigured = () => true;
+  storageService.uploadFile = async () => { throw new Error('storage unavailable'); };
+  storageService.deleteFile = async (fileId) => { operations.push(['delete', fileId]); };
+  try {
+    const res = mockResponse();
+    await uploadController.handleAvatarUpload({ user: { id: 'student-1' }, file: { filename: 'avatar.png', path: filePath, size: 6, mimetype: 'image/png' } }, res, assert.fail);
+    assert.equal(res.statusCode, 201);
+    assert.equal(await fs.readFile(filePath, 'utf8'), 'avatar');
+    assert.deepEqual(operations, [
+      ['metadata', { $unset: { profileIconFileId: 1 } }],
+      ['delete', 'old-avatar-id'],
+    ]);
+  } finally {
+    User.findById = originals.findById;
+    User.findByIdAndUpdate = originals.findByIdAndUpdate;
+    userService.updateProfile = originals.updateProfile;
+    storageService.isConfigured = originals.isConfigured;
+    storageService.uploadFile = originals.uploadFile;
+    storageService.deleteFile = originals.deleteFile;
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('avatar fallback metadata failure preserves the old centralized file and referenced local file', async () => {
+  const originals = {
+    findById: User.findById,
+    findByIdAndUpdate: User.findByIdAndUpdate,
+    updateProfile: userService.updateProfile,
+    isConfigured: storageService.isConfigured,
+    uploadFile: storageService.uploadFile,
+    deleteFile: storageService.deleteFile,
+  };
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'showmyskills-avatar-fallback-metadata-'));
+  const filePath = path.join(directory, 'avatar.png');
+  await fs.writeFile(filePath, 'avatar');
+  const deletedIds = [];
+  User.findById = () => ({ select: () => ({ lean: async () => ({ profileIconFileId: 'old-avatar-id' }) }) });
+  User.findByIdAndUpdate = () => { throw new Error('metadata unset failed'); };
+  userService.updateProfile = async (_id, data) => ({ profileIcon: data.profileIcon });
+  storageService.isConfigured = () => true;
+  storageService.uploadFile = async () => { throw new Error('storage unavailable'); };
+  storageService.deleteFile = async (fileId) => { deletedIds.push(fileId); };
+
+  try {
+    let forwarded;
+    await uploadController.handleAvatarUpload({
+      user: { id: 'student-1' },
+      file: { filename: 'avatar.png', path: filePath, originalname: 'avatar.png', mimetype: 'image/png' },
+    }, mockResponse(), (error) => { forwarded = error; });
+    assert.match(forwarded.message, /metadata unset failed/);
+    assert.equal(await fs.readFile(filePath, 'utf8'), 'avatar');
+    assert.deepEqual(deletedIds, []);
+  } finally {
+    User.findById = originals.findById;
+    User.findByIdAndUpdate = originals.findByIdAndUpdate;
+    userService.updateProfile = originals.updateProfile;
+    storageService.isConfigured = originals.isConfigured;
+    storageService.uploadFile = originals.uploadFile;
+    storageService.deleteFile = originals.deleteFile;
     await fs.rm(directory, { recursive: true, force: true });
   }
 });

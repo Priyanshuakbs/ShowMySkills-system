@@ -11,6 +11,8 @@ import uploadRoutes from '../src/routes/uploadRoutes.js';
 import { uploadController } from '../src/controllers/uploadController.js';
 import { uploadResume, formatFileUrl } from '../src/services/uploadService.js';
 import { authMiddleware } from '../src/middleware/authMiddleware.js';
+import { userService } from '../src/services/userService.js';
+import storageService from '../src/services/storageService.js';
 
 const resumeDirectory = path.join(process.cwd(), 'uploads', 'resumes');
 const makeFile = async (name, content = 'resume content') => {
@@ -264,6 +266,103 @@ test('missing user and database update failures clean up the new resume file', a
     User.findByIdAndUpdate = originalFindByIdAndUpdate;
     await fs.rm(missingPath, { force: true });
     if (failurePath) await fs.rm(failurePath, { force: true });
+  }
+});
+
+test('resume metadata failure preserves centralized files and removes the local temporary file', async () => {
+  const originals = {
+    findById: User.findById,
+    findByIdAndUpdate: User.findByIdAndUpdate,
+    updateResume: userService.updateResume,
+    isConfigured: storageService.isConfigured,
+    uploadFile: storageService.uploadFile,
+    deleteFile: storageService.deleteFile,
+  };
+  const filename = `metadata-failure-${Date.now()}.pdf`;
+  const filePath = await makeFile(filename);
+  const oldUrl = 'https://storage.example/old-resume';
+  const deletedIds = [];
+  User.findById = () => ({ select: async () => ({ resumeUrl: oldUrl, resumeFileId: 'old-resume-id' }) });
+  User.findByIdAndUpdate = () => { throw new Error('metadata write failed'); };
+  userService.updateResume = async (_id, resumeUrl) => ({ resumeUrl, completionPercentage: 80 });
+  storageService.isConfigured = () => true;
+  storageService.uploadFile = async () => ({ url: 'https://storage.example/new-resume', fileId: 'new-resume-id' });
+  storageService.deleteFile = async (fileId) => { deletedIds.push(fileId); };
+  try {
+    let forwarded;
+    const res = mockResponse();
+    await uploadController.handleResumeUpload(makeRequest(filename, filePath), res, (error) => { forwarded = error; });
+    assert.match(forwarded.message, /metadata write failed/);
+    await assert.rejects(fs.access(filePath), { code: 'ENOENT' });
+    assert.deepEqual(deletedIds, []);
+  } finally {
+    User.findById = originals.findById;
+    User.findByIdAndUpdate = originals.findByIdAndUpdate;
+    userService.updateResume = originals.updateResume;
+    storageService.isConfigured = originals.isConfigured;
+    storageService.uploadFile = originals.uploadFile;
+    storageService.deleteFile = originals.deleteFile;
+    await fs.rm(filePath, { force: true });
+  }
+});
+
+test('resume centralized upload removes its local temporary file after profile and metadata persistence', async () => {
+  const originals = {
+    findById: User.findById,
+    findByIdAndUpdate: User.findByIdAndUpdate,
+    updateResume: userService.updateResume,
+    isConfigured: storageService.isConfigured,
+    uploadFile: storageService.uploadFile,
+    deleteFile: storageService.deleteFile,
+  };
+  const filename = `central-cleanup-${Date.now()}.pdf`;
+  const filePath = await makeFile(filename);
+  User.findById = () => ({ select: async () => ({ resumeUrl: '', resumeFileId: '' }) });
+  User.findByIdAndUpdate = async () => ({});
+  userService.updateResume = async (_id, resumeUrl) => ({ resumeUrl, completionPercentage: 80 });
+  storageService.isConfigured = () => true;
+  storageService.uploadFile = async () => ({ url: 'https://storage.example/new-resume', fileId: 'new-resume-id' });
+  storageService.deleteFile = async () => {};
+  try {
+    const res = mockResponse();
+    await uploadController.handleResumeUpload(makeRequest(filename, filePath), res, assert.fail);
+    assert.equal(res.statusCode, 201);
+    await assert.rejects(fs.access(filePath), { code: 'ENOENT' });
+  } finally {
+    User.findById = originals.findById;
+    User.findByIdAndUpdate = originals.findByIdAndUpdate;
+    userService.updateResume = originals.updateResume;
+    storageService.isConfigured = originals.isConfigured;
+    storageService.uploadFile = originals.uploadFile;
+    storageService.deleteFile = originals.deleteFile;
+    await fs.rm(filePath, { force: true });
+  }
+});
+
+test('resume local fallback preserves the file referenced by the saved profile URL', async () => {
+  const originals = {
+    findById: User.findById,
+    updateResume: userService.updateResume,
+    isConfigured: storageService.isConfigured,
+    uploadFile: storageService.uploadFile,
+  };
+  const filename = `local-fallback-${Date.now()}.pdf`;
+  const filePath = await makeFile(filename);
+  User.findById = () => ({ select: async () => ({ resumeUrl: '', resumeFileId: '' }) });
+  userService.updateResume = async (_id, resumeUrl) => ({ resumeUrl, completionPercentage: 80 });
+  storageService.isConfigured = () => true;
+  storageService.uploadFile = async () => { throw new Error('storage unavailable'); };
+  try {
+    const res = mockResponse();
+    await uploadController.handleResumeUpload(makeRequest(filename, filePath), res, assert.fail);
+    assert.equal(res.statusCode, 201);
+    assert.equal(await fs.readFile(filePath, 'utf8'), 'resume content');
+  } finally {
+    User.findById = originals.findById;
+    userService.updateResume = originals.updateResume;
+    storageService.isConfigured = originals.isConfigured;
+    storageService.uploadFile = originals.uploadFile;
+    await fs.rm(filePath, { force: true });
   }
 });
 
